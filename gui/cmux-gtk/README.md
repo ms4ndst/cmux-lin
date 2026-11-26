@@ -4,7 +4,7 @@ A throwaway prototype of a native GTK4 window for a cmux-tui session. It's here 
 
 The cmux-tui server stays in charge of everything. This window is just another client:
 
-- the sidebar lists the session's workspaces (re-read every 1.5 s, and straight after every action);
+- the sidebar lists the session's workspaces (re-read every 1.5 s, and straight after every action), with an **Agents** queue below them and a **Files** view one click away (see Sidebar);
 - which workspace, screen, tab and pane you're looking at belongs to this window alone, as in upstream's design: switching here doesn't move the TUI or another window, and switching there doesn't move this one. Things just created (a new workspace, screen or tab, including one a tab was moved into) come into view;
 - a screen strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout): click one to switch, `×` to close it and its terminals, `+` for a new one. Each screen button shows the most urgent agent badge on that screen;
 - the active screen's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
@@ -69,6 +69,13 @@ When a tab with a finished turn or an unread notification is on screen and the w
 
 Notifications also go to the desktop notification service (dunst, GNOME Shell and so on), unless you're already looking at that terminal. Clicking one jumps to its tab. The latest notification also shows in the status line for a few seconds.
 
+## Sidebar
+
+Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+F`:
+
+- **Workspaces**, with the **Agents** queue underneath while agents run: every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
+- **Files**: a browser on the focused terminal's working directory, following it as you `cd` (asked from the session with `process-info`) until you navigate yourself; `~` follows again. Double-click or Enter opens a folder, or a file in `$EDITOR` in a new tab. `c` (or the `cd` button) changes the focused pane to the selected folder, `o` opens `.md`/`.html` in a browser tab, `.` shows dotfiles, Backspace goes up, and the field filters by name.
+
 ## Keyboard shortcuts
 
 They act on the pane you're typing in:
@@ -84,6 +91,7 @@ They act on the pane you're typing in:
 | `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
+| `Ctrl+Shift+F` | Sidebar: Workspaces / Files |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
 
@@ -118,7 +126,7 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 ## Not done
 
 - moving whole panes between workspaces (tabs move; a pane empties and closes);
-- the TUI's sidebar views (machines, files, custom sidebar plugins);
+- the TUI's machines view and custom sidebar plugins (`sidebar.plugin`), which need remote machines or a plugin configured on the server;
 
 ## Debugging
 

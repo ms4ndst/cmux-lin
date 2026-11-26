@@ -63,7 +63,7 @@ impl Attn {
 
 /// The most urgent attention state of one tab, if any.
 pub fn of_tab(tab: &Tab, agents: &Agents) -> Option<Attn> {
-    let agent = match agents.get(&tab.surface).map(String::as_str) {
+    let agent = match agents.get(&tab.surface).map(|a| a.status.as_str()) {
         Some("blocked") => Some(Attn::Blocked),
         Some("done") => Some(Attn::Done),
         Some("working") => Some(Attn::Working),

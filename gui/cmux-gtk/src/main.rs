@@ -28,6 +28,7 @@
 mod attention;
 mod backend;
 mod browser;
+mod files;
 
 use cmux_browser_provider as provider;
 
@@ -191,6 +192,12 @@ impl State {
 #[derive(Clone)]
 struct Ui {
     list: gtk::ListBox,
+    /// The agents queue under the workspace list, and its rows.
+    agents_box: gtk::Box,
+    agents_list: gtk::ListBox,
+    /// Workspaces / Files.
+    sidebar_stack: gtk::Stack,
+    files: files::FilesView,
     /// The selected workspace's screens, above the panes.
     screens: gtk::Box,
     content: gtk::Box,
@@ -264,11 +271,62 @@ fn build_ui(app: &gtk::Application, session: &str) {
     placeholder.add_css_class("dim-label");
     placeholder.set_margin_top(24);
     list.set_placeholder(Some(&placeholder));
-    let sidebar = gtk::ScrolledWindow::builder()
+    let workspaces_scroller = gtk::ScrolledWindow::builder()
         .child(&list)
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .width_request(200)
+        .vexpand(true)
         .build();
+    // Agents queue (as in the TUI): every agent across all workspaces, most
+    // urgent first; shown only while agents exist.
+    let agents_list = gtk::ListBox::new();
+    agents_list.add_css_class("navigation-sidebar");
+    agents_list.set_activate_on_single_click(true);
+    let agents_heading = gtk::Label::new(Some("Agents"));
+    agents_heading.set_xalign(0.0);
+    agents_heading.add_css_class("heading");
+    agents_heading.set_margin_start(8);
+    agents_heading.set_margin_top(6);
+    let agents_scroller = gtk::ScrolledWindow::builder()
+        .child(&agents_list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(320)
+        .build();
+    let agents_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    agents_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    agents_box.append(&agents_heading);
+    agents_box.append(&agents_scroller);
+    agents_box.set_visible(false);
+    let workspaces_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    workspaces_page.append(&workspaces_scroller);
+    workspaces_page.append(&agents_box);
+
+    // Files view; its requests are wired up once the state exists.
+    let files_host_slot: Rc<RefCell<Option<files::Host>>> = Rc::new(RefCell::new(None));
+    let files_view = files::FilesView::new(Rc::new({
+        let slot = files_host_slot.clone();
+        move |request| {
+            let host = slot.borrow().clone();
+            if let Some(host) = host {
+                host(request);
+            }
+        }
+    }));
+
+    let sidebar_stack = gtk::Stack::new();
+    sidebar_stack.add_titled(&workspaces_page, Some("workspaces"), "Workspaces");
+    sidebar_stack.add_titled(&files_view.root, Some("files"), "Files");
+    sidebar_stack.set_vexpand(true);
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&sidebar_stack));
+    switcher.set_margin_start(4);
+    switcher.set_margin_end(4);
+    switcher.set_margin_top(4);
+    switcher.set_tooltip_text(Some("Workspaces / Files (Ctrl+Shift+F)"));
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    sidebar.set_width_request(200);
+    sidebar.append(&switcher);
+    sidebar.append(&sidebar_stack);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
@@ -301,7 +359,17 @@ fn build_ui(app: &gtk::Application, session: &str) {
     paned.set_position(220);
     window.set_child(Some(&paned));
 
-    let ui = Ui { list: list.clone(), screens, content, status: status.clone(), new_ws: new_ws.clone() };
+    let ui = Ui {
+        list: list.clone(),
+        agents_box,
+        agents_list: agents_list.clone(),
+        sidebar_stack: sidebar_stack.clone(),
+        files: files_view.clone(),
+        screens,
+        content,
+        status: status.clone(),
+        new_ws: new_ws.clone(),
+    };
     set_live(&ui, false);
 
     // --- backend -------------------------------------------------------
@@ -337,6 +405,66 @@ fn build_ui(app: &gtk::Application, session: &str) {
         browser_problem: None,
     }));
     state.borrow_mut().ui = Some(ui.clone());
+
+    // Files view requests act on the focused pane.
+    *files_host_slot.borrow_mut() = Some(Rc::new({
+        let state = state.clone();
+        move |request| {
+            let st = state.borrow();
+            let Some(pane) = st.target_pane() else { return };
+            match request {
+                files::Request::Cd(dir) => {
+                    let terminal = st.panes.get(&pane).filter(|v| !v.browser).and_then(|v| v.attachment.as_ref());
+                    if let Some(attachment) = terminal {
+                        attachment.send(format!("cd {}\r", files::shell_quote(&dir)).as_bytes());
+                    }
+                }
+                files::Request::Edit(file) => {
+                    let command = format!("${{EDITOR:-vi}} {}", files::shell_quote(&file));
+                    let mut request = json!({ "cmd": "run", "command": command, "pane": pane });
+                    if let Some(dir) = file.parent() {
+                        request["cwd"] = json!(dir.display().to_string());
+                    }
+                    st.send(Ctl::request(request));
+                }
+                files::Request::Browse(file) => {
+                    st.send(Ctl::request(json!({ "cmd": "new-browser-tab", "pane": pane, "url": files::file_url(&file) })));
+                }
+            }
+        }
+    }));
+
+    agents_list.connect_row_activated({
+        let state = state.clone();
+        let ui = ui.clone();
+        move |_, row| {
+            let surface = row.widget_name().parse::<u64>().ok();
+            if let Some(surface) = surface {
+                show_surface_tab(&state, &ui, surface);
+            }
+        }
+    });
+
+    // While the files view shows and follows, keep it on the focused
+    // terminal's working directory.
+    glib::timeout_add_local(Duration::from_millis(1500), {
+        let state = state.clone();
+        let ui = ui.clone();
+        move || {
+            if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") && ui.files.following() {
+                let st = state.borrow();
+                let surface = st
+                    .target_pane()
+                    .and_then(|pane| st.panes.get(&pane))
+                    .filter(|v| !v.browser)
+                    .and_then(|v| v.surface);
+                if let Some(surface) = surface {
+                    st.send(Ctl::ProcessInfo { surface });
+                }
+            }
+            glib::ControlFlow::Continue
+        }
+    });
 
     // Browser tabs need a browser provider; run one unless disabled. It
     // stays idle when another provider (cmux-browser or a standalone
@@ -442,6 +570,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
                     UiMsg::Connected => set_live(&ui, true),
                     UiMsg::Copied { generation, result, cut } => on_copied(&state, &ui, generation, result, cut),
                     UiMsg::UndoConfirm { pane, revision, closes } => confirm_undo(&state, pane, revision, closes),
+                    UiMsg::Cwd(cwd) => ui.files.follow_to(std::path::Path::new(&cwd)),
                     UiMsg::FileChooser { generation, node, multiple } => {
                         choose_files(&state, &ui, generation, node, multiple);
                     }
@@ -517,6 +646,17 @@ fn build_ui(app: &gtk::Application, session: &str) {
 
     // Copy / paste in the focused browser tab, also reachable as actions
     // (menus, D-Bus): `app.browser-copy`, `app.browser-paste`.
+    // Workspaces / Files sidebar view (also Ctrl+Shift+F).
+    let toggle_files = gio::SimpleAction::new("toggle-files", None);
+    toggle_files.connect_activate({
+        let ui = ui.clone();
+        move |_, _| {
+            let next = if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") { "workspaces" } else { "files" };
+            ui.sidebar_stack.set_visible_child_name(next);
+        }
+    });
+    app.add_action(&toggle_files);
+
     let open_menu = gio::SimpleAction::new("browser-menu", None);
     open_menu.connect_activate({
         let state = state.clone();
@@ -590,6 +730,13 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>o", |st, pane| st.borrow().send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.borrow().send(new_browser_tab(pane)));
     bind("<Control><Shift>u", |st, pane| st.borrow().send(Ctl::Undo { pane, confirm: None }));
+    bind("<Control><Shift>f", |st, _| {
+        let ui = st.borrow().ui.clone();
+        if let Some(ui) = ui {
+            let next = if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") { "workspaces" } else { "files" };
+            ui.sidebar_stack.set_visible_child_name(next);
+        }
+    });
     bind("<Control><Shift>g", |st, pane| {
         st.borrow().send(Ctl::request(json!({ "cmd": "new-pane-right", "pane": pane })));
     });
@@ -721,7 +868,71 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     if let Some(row) = target.and_then(|i| ui.list.row_at_index(i as i32)) {
         ui.list.select_row(Some(&row));
     }
+    draw_agents(state, ui);
     render(state, ui);
+}
+
+/// The agents queue: every agent across all workspaces, blocked first, then
+/// finished, working, idle, unknown; the most recent change first within
+/// each. Click one to jump to its tab. Hidden while there are no agents.
+fn draw_agents(state: &Shared, ui: &Ui) {
+    while let Some(row) = ui.agents_list.row_at_index(0) {
+        ui.agents_list.remove(&row);
+    }
+    let st = state.borrow();
+    let rank = |status: &str| match status {
+        "blocked" => 0,
+        "done" => 1,
+        "working" => 2,
+        "idle" => 3,
+        _ => 4,
+    };
+    let mut agents: Vec<(u64, &backend::Agent)> = st.agents.iter().map(|(s, a)| (*s, a)).collect();
+    agents.sort_by(|a, b| rank(&a.1.status).cmp(&rank(&b.1.status)).then(b.1.updated_at.cmp(&a.1.updated_at)));
+    let mut shown = 0;
+    for (surface, agent) in agents {
+        // Where it lives: workspace name and tab title.
+        let place = st.raw.iter().find_map(|ws| {
+            ws.all_tabs().find(|t| t.surface == surface).map(|t| {
+                let ws_name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+                (ws_name, t.name.clone().unwrap_or_else(|| t.title.clone()))
+            })
+        });
+        let Some((ws_name, title)) = place else { continue };
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        line.set_margin_start(6);
+        line.set_margin_top(3);
+        line.set_margin_bottom(3);
+        let glyph = match agent.status.as_str() {
+            "blocked" => attention::badge(Attn::Blocked, 1),
+            "done" => attention::badge(Attn::Done, 1),
+            "working" => attention::badge(Attn::Working, 1),
+            other => {
+                let label = gtk::Label::new(Some(if other == "idle" { "○" } else { "·" }));
+                label.add_css_class("dim-label");
+                label.set_tooltip_text(Some(if other == "idle" { "Agent idle" } else { "Agent state unknown" }));
+                label
+            }
+        };
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let title_label = gtk::Label::new(Some(if title.is_empty() { "agent" } else { &title }));
+        title_label.set_xalign(0.0);
+        title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let place_label = gtk::Label::new(Some(&format!("{ws_name} · {}", agent.status)));
+        place_label.set_xalign(0.0);
+        place_label.add_css_class("dim-label");
+        place_label.add_css_class("caption");
+        text.append(&title_label);
+        text.append(&place_label);
+        line.append(&glyph);
+        line.append(&text);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&line));
+        row.set_widget_name(&surface.to_string());
+        ui.agents_list.append(&row);
+        shown += 1;
+    }
+    ui.agents_box.set_visible(shown > 0);
 }
 
 /// The server tree with this window's own screen and tab choices applied:
@@ -1800,7 +2011,7 @@ fn ack_seen(state: &Shared) {
         if !st.panes.contains_key(&pane.id) {
             continue;
         }
-        let done = st.agents.get(&tab.surface).is_some_and(|s| s == "done");
+        let done = st.agents.get(&tab.surface).is_some_and(|a| a.status == "done");
         if !done && tab.unread.is_none() {
             st.acked.remove(&tab.surface);
             continue;

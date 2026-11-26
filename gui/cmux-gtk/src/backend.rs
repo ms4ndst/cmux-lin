@@ -141,10 +141,18 @@ pub struct Tab {
     pub unread: Option<String>,
 }
 
-/// Agent status per terminal surface, in `list-agents`' one-vocabulary
-/// `status` form: `blocked`, `done` (finished a turn nobody has seen yet),
-/// `working`, `idle`, `unknown`.
-pub type Agents = std::collections::HashMap<u64, String>;
+/// An agent's state, from `list-agents`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Agent {
+    /// The one-vocabulary `status`: `blocked`, `done` (finished a turn
+    /// nobody has seen yet), `working`, `idle`, `unknown`.
+    pub status: String,
+    /// When it last changed (ms since the epoch), for ordering the queue.
+    pub updated_at: u64,
+}
+
+/// Agents by terminal surface.
+pub type Agents = std::collections::HashMap<u64, Agent>;
 
 /// Messages from workers to the UI.
 pub enum UiMsg {
@@ -159,6 +167,8 @@ pub enum UiMsg {
     /// The selection read from a browser tab for copy (or cut), for the
     /// attachment with this `generation`.
     Copied { generation: u64, result: Result<String, String>, cut: bool },
+    /// The focused terminal's working directory (for the files view).
+    Cwd(String),
     /// Undoing the layout on `pane`'s screen would close `closes` panes:
     /// ask, then confirm with `revision`.
     UndoConfirm { pane: u64, revision: u64, closes: usize },
@@ -204,6 +214,8 @@ pub enum Ctl {
     NewWorkspace,
     /// Re-poll now (sent by the event thread when something changed).
     Poke,
+    /// Report the working directory of terminal `surface` ([`UiMsg::Cwd`]).
+    ProcessInfo { surface: u64 },
     /// Undo the latest layout change on `pane`'s screen; `confirm` is the
     /// preview revision when confirming an undo that closes panes.
     Undo { pane: u64, confirm: Option<u64> },
@@ -296,6 +308,21 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             let result = match ctl {
                 Ctl::Poke => Ok(()),
                 Ctl::Undo { pane, confirm } => undo_layout(client, ui, pane, confirm),
+                Ctl::ProcessInfo { surface } => {
+                    let mut request = serde_json::Map::new();
+                    request.insert("cmd".into(), json!("process-info"));
+                    request.insert("surface".into(), json!(surface));
+                    client.request_raw(request).map(|response| {
+                        let data = response.get("data").cloned().unwrap_or(response);
+                        // The live foreground cwd, else what the shell reported.
+                        let cwd = ["foreground_cwd", "cwd"]
+                            .iter()
+                            .find_map(|key| data.get(*key).and_then(Value::as_str).filter(|c| !c.is_empty()));
+                        if let Some(cwd) = cwd {
+                            let _ = ui.send_blocking(UiMsg::Cwd(cwd.to_string()));
+                        }
+                    })
+                }
                 Ctl::NewWorkspace => client
                     .new_workspace(NewWorkspaceRequest {
                         name: Optional::Value("gtk".to_string()),
@@ -369,7 +396,8 @@ fn list_agents(client: &mut Client) -> Result<Agents, Error> {
                 .filter_map(|agent| {
                     let surface = agent.get("surface")?.as_u64()?;
                     let status = agent.get("status").and_then(Value::as_str).or_else(|| agent.get("state")?.as_str())?;
-                    Some((surface, status.to_string()))
+                    let updated_at = agent.get("updated_at_ms").and_then(Value::as_u64).unwrap_or(0);
+                    Some((surface, Agent { status: status.to_string(), updated_at }))
                 })
                 .collect()
         })
