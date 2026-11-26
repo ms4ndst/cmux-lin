@@ -216,10 +216,11 @@ pub enum Ctl {
     NewWorkspace,
     /// Re-poll now (sent by the event thread when something changed).
     Poke,
-    /// End the given terminals (`terminal_id`s), then remove the workspace.
-    /// `close-workspace` alone only removes placements: its shells would
-    /// keep running unseen in the session.
-    CloseWorkspace { workspace: u64, terminals: Vec<String> },
+    /// Run a close request (`close-surface`, `close-pane`, `close-screen`,
+    /// `close-workspace`), then end the shells it removed (`terminal_id`s).
+    /// The close commands only remove placements: on their own the shells
+    /// would keep running unseen in the session.
+    Close { request: Value, terminals: Vec<String> },
     /// Report the working directory of terminal `surface` ([`UiMsg::Cwd`]).
     ProcessInfo { surface: u64 },
     /// Undo the latest layout change on `pane`'s screen; `confirm` is the
@@ -314,17 +315,21 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             let result = match ctl {
                 Ctl::Poke => Ok(()),
                 Ctl::Undo { pane, confirm } => undo_layout(client, ui, pane, confirm),
-                Ctl::CloseWorkspace { workspace, terminals } => {
+                Ctl::Close { request, terminals } => {
+                    let closed = match request {
+                        Value::Object(request) => client.request_raw(request).map(|_| ()),
+                        _ => Ok(()),
+                    };
+                    // A terminal stays addressable after its placement goes,
+                    // so ending it afterwards is fine (and already-ended ones
+                    // are no error).
                     for terminal in terminals {
                         let mut request = serde_json::Map::new();
                         request.insert("cmd".into(), json!("close-terminal"));
                         request.insert("terminal_id".into(), json!(terminal));
-                        let _ = client.request_raw(request); // already gone is fine
+                        let _ = client.request_raw(request);
                     }
-                    let mut request = serde_json::Map::new();
-                    request.insert("cmd".into(), json!("close-workspace"));
-                    request.insert("workspace".into(), json!(workspace));
-                    client.request_raw(request).map(|_| ())
+                    closed
                 }
                 Ctl::ProcessInfo { surface } => {
                     let mut request = serde_json::Map::new();

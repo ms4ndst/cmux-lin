@@ -882,7 +882,7 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui) {
                 let ws_id = if by_id { target.and_then(|t| t.get::<u64>()) } else { state.borrow().selected };
                 let Some(ws_id) = ws_id else { return };
                 if closing {
-                    confirm_close_workspace(&state, ws_id);
+                    close_with_shells(&state, Closing::Workspace(ws_id));
                 } else {
                     rename(&state, &ui, ws_id);
                 }
@@ -892,36 +892,80 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui) {
     }
 }
 
-/// Closing a workspace ends its shells: say which and how many, then close.
-fn confirm_close_workspace(state: &Shared, ws_id: u64) {
+/// Something to close from the window.
+enum Closing {
+    Tab(u64),
+    Pane(u64),
+    Screen(u64),
+    Workspace(u64),
+}
+
+/// Close a tab, pane, screen or workspace and end the shells it held. The
+/// server's close commands only remove placements; without this the shells
+/// would keep running unseen. A single tab closes at once; a pane or screen
+/// holding two or more shells, and any workspace, asks first.
+fn close_with_shells(state: &Shared, what: Closing) {
     let st = state.borrow();
-    let Some(ws) = st.raw.iter().find(|w| w.id == ws_id) else { return };
-    let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
-    let terminals: Vec<String> = ws.all_tabs().filter_map(|t| t.terminal_id.clone()).collect();
-    let browsers = ws.all_tabs().filter(|t| !t.terminal).count();
-    let Some(window) = st.window.upgrade() else { return };
+    let all_screens = || st.raw.iter().flat_map(|ws| ws.screens.iter().map(move |s| (ws, s)));
+    let (request, tabs, title, always_ask): (Value, Vec<backend::Tab>, String, bool) = match what {
+        Closing::Tab(surface) => {
+            let tab = st.raw.iter().flat_map(|ws| ws.all_tabs()).find(|t| t.surface == surface).cloned();
+            (json!({ "cmd": "close-surface", "surface": surface }), tab.into_iter().collect(), String::new(), false)
+        }
+        Closing::Pane(pane) => {
+            let tabs = all_screens()
+                .flat_map(|(_, s)| &s.panes)
+                .find(|p| p.id == pane)
+                .map(|p| p.tabs.clone())
+                .unwrap_or_default();
+            (json!({ "cmd": "close-pane", "pane": pane }), tabs, "this pane".into(), false)
+        }
+        Closing::Screen(screen) => {
+            let found = all_screens().find(|(_, s)| s.id == screen);
+            let tabs = found.map(|(_, s)| s.panes.iter().flat_map(|p| p.tabs.clone()).collect()).unwrap_or_default();
+            let title = found
+                .and_then(|(ws, s)| {
+                    let index = ws.screens.iter().position(|x| x.id == s.id)?;
+                    Some(s.name.clone().map_or(format!("screen {}", index + 1), |n| format!("screen “{n}”")))
+                })
+                .unwrap_or_else(|| "this screen".into());
+            (json!({ "cmd": "close-screen", "screen": screen }), tabs, title, false)
+        }
+        Closing::Workspace(id) => {
+            let Some(ws) = st.raw.iter().find(|w| w.id == id) else { return };
+            let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+            (json!({ "cmd": "close-workspace", "workspace": id }), ws.all_tabs().cloned().collect(), format!("workspace “{name}”"), true)
+        }
+    };
+    let terminals: Vec<String> = tabs.iter().filter_map(|t| t.terminal_id.clone()).collect();
+    let browsers = tabs.iter().filter(|t| !t.terminal).count();
     let ctl = st.ctl.clone();
+    if !always_ask && terminals.len() < 2 {
+        let _ = ctl.send(Ctl::Close { request, terminals });
+        return;
+    }
+    let Some(window) = st.window.upgrade() else { return };
     drop(st);
     let mut detail = format!(
-        "This ends {} shell{} running in it",
+        "This ends the {} shell{} running there",
         terminals.len(),
         if terminals.len() == 1 { "" } else { "s" }
     );
     if browsers > 0 {
         detail.push_str(&format!(" and closes {browsers} browser tab{}", if browsers == 1 { "" } else { "s" }));
     }
-    detail.push_str(". Anything running there stops.");
+    detail.push_str(". Anything still running in them stops.");
     let dialog = gtk::AlertDialog::builder()
-        .message(format!("Close workspace “{name}”?"))
+        .message(format!("Close {title}?"))
         .detail(detail)
-        .buttons(["Cancel", "Close workspace"])
+        .buttons(["Cancel", "Close"])
         .cancel_button(0)
         .default_button(0)
         .modal(true)
         .build();
     glib::spawn_future_local(async move {
         if let Ok(1) = dialog.choose_future(Some(&window)).await {
-            let _ = ctl.send(Ctl::CloseWorkspace { workspace: ws_id, terminals });
+            let _ = ctl.send(Ctl::Close { request, terminals });
         }
     });
 }
@@ -971,9 +1015,9 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>Page_Down", |st, _| step_screen(st, 1));
     bind("<Control><Shift>Page_Up", |st, _| step_screen(st, -1));
     bind("<Control><Shift>w", |st, pane| {
-        let st = st.borrow();
-        if let Some(surface) = st.panes.get(&pane).and_then(|v| v.surface) {
-            st.send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })));
+        let surface = st.borrow().panes.get(&pane).and_then(|v| v.surface);
+        if let Some(surface) = surface {
+            close_with_shells(st, Closing::Tab(surface));
         }
     });
     bind("<Control>Page_Down", |st, pane| step_tab(st, pane, 1));
@@ -1360,11 +1404,11 @@ fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
         close.add_css_class("flat");
         close.add_css_class("tab-close");
         close.set_focus_on_click(false);
-        close.set_tooltip_text(Some("Close screen (and the terminals on it)"));
+        close.set_tooltip_text(Some("Close screen (ends the shells on it)"));
         let screen_id = screen.id;
         close.connect_clicked({
-            let send = send.clone();
-            move |_| send(json!({ "cmd": "close-screen", "screen": screen_id }))
+            let state = state.clone();
+            move |_| close_with_shells(&state, Closing::Screen(screen_id))
         });
         on_double_click(&button, {
             let (strip, button, send, current) =
@@ -2121,10 +2165,10 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
         close.add_css_class("tab-close");
-        close.set_tooltip_text(Some("Close tab (Ctrl+Shift+W)"));
+        close.set_tooltip_text(Some("Close tab and end its shell (Ctrl+Shift+W)"));
         close.connect_clicked({
-            let send = send.clone();
-            move |_| send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })))
+            let state = state.clone();
+            move |_| close_with_shells(&state, Closing::Tab(surface))
         });
         on_double_click(&button, {
             let (tabbar, button, send, current) =
@@ -2288,7 +2332,10 @@ fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: 
     });
     group.add_action(&move_new);
     let close = gio::SimpleAction::new("close", None);
-    close.connect_activate(move |_, _| send(json!({ "cmd": "close-pane", "pane": id })));
+    close.connect_activate({
+        let state = state.clone();
+        move |_, _| close_with_shells(&state, Closing::Pane(id))
+    });
     group.add_action(&close);
     root.insert_action_group("pane", Some(&group));
 }
