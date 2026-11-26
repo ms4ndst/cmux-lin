@@ -2,7 +2,7 @@
 //!
 //! Two kinds of worker talk to the session socket:
 //! - one control thread (upstream's Rust SDK) polls the workspace tree and
-//!   creates workspaces;
+//!   runs layout commands (new workspace/tab, split, select, close);
 //! - one [`Attachment`] per viewed terminal owns a byte-mode attach
 //!   connection. Its reader forwards the VT replay and live output to the UI;
 //!   its writer sends input and size reports **on that same connection**.
@@ -30,23 +30,73 @@ use serde_json::{Value, json};
 /// How often the control thread re-reads the workspace tree.
 const TREE_POLL: Duration = Duration::from_millis(1500);
 
-/// A workspace as the sidebar shows it.
+/// A workspace: sidebar row plus the active screen's layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {
     pub id: u64,
     pub name: String,
     pub active: bool,
-    /// The terminal surface to show: the active tab of the active pane of
-    /// the active screen. `None` when that tab is a browser or missing.
-    pub surface: Option<u64>,
+    /// Title of the active pane's active tab, for the sidebar subtitle.
     pub title: String,
+    pub layout: Option<Layout>,
+    pub panes: Vec<Pane>,
+    pub active_pane: Option<u64>,
+}
+
+/// The active screen's split tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Layout {
+    Leaf(u64),
+    /// `right`: `a` left of `b`; otherwise `a` above `b`. `ratio` is `a`'s share.
+    Split { id: Option<u64>, right: bool, ratio: f64, a: Box<Layout>, b: Box<Layout> },
+}
+
+impl Layout {
+    /// Structure only (pane ids, split ids, directions). Ratios are left out
+    /// so dragging a divider never forces a rebuild.
+    pub fn signature(&self) -> String {
+        match self {
+            Layout::Leaf(pane) => format!("p{pane}"),
+            Layout::Split { id, right, a, b, .. } => {
+                format!("s{}{}({},{})", id.unwrap_or(0), if *right { "r" } else { "d" }, a.signature(), b.signature())
+            }
+        }
+    }
+
+    pub fn panes(&self) -> Vec<u64> {
+        match self {
+            Layout::Leaf(pane) => vec![*pane],
+            Layout::Split { a, b, .. } => [a.panes(), b.panes()].concat(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pane {
+    pub id: u64,
+    pub active_tab: usize,
+    pub tabs: Vec<Tab>,
+}
+
+impl Pane {
+    /// The terminal surface to show; `None` for a browser tab or no tabs.
+    pub fn surface(&self) -> Option<u64> {
+        self.tabs.get(self.active_tab).filter(|tab| tab.terminal).map(|tab| tab.surface)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tab {
+    pub surface: u64,
+    pub title: String,
+    pub terminal: bool,
 }
 
 /// Messages from workers to the UI.
 pub enum UiMsg {
     Tree(Vec<Workspace>),
-    /// Output for the attachment started with `generation`; stale
-    /// generations are dropped by the UI after a switch.
+    /// Output for the attachment with this `generation` (unique across all
+    /// panes); events from replaced attachments are dropped by the UI.
     Attach { generation: u64, event: AttachEvent },
     Status(String),
 }
@@ -62,6 +112,15 @@ pub enum AttachEvent {
 /// Requests from the UI to the control thread.
 pub enum Ctl {
     NewWorkspace,
+    /// Any protocol command as a JSON object with `cmd` (e.g. `split`,
+    /// `new-tab`, `select-tab`, `close-surface`, `focus-pane`).
+    Request(Value),
+}
+
+impl Ctl {
+    pub fn request(request: Value) -> Self {
+        Ctl::Request(request)
+    }
 }
 
 pub fn config_for(session: &str) -> Result<ClientConfig, Error> {
@@ -97,14 +156,22 @@ pub fn spawn_control(config: ClientConfig, rx: Receiver<Ctl>, ui: async_channel:
                     return;
                 }
             }
+            // Wait for a request or the next poll. After a request, loop
+            // straight back to re-read the tree so the UI updates at once.
             match rx.recv_timeout(TREE_POLL) {
-                Ok(Ctl::NewWorkspace) => {
-                    let result = client.new_workspace(NewWorkspaceRequest {
-                        name: Optional::Value("gtk".to_string()),
-                        ..Default::default()
-                    });
+                Ok(ctl) => {
+                    let result = match ctl {
+                        Ctl::NewWorkspace => client
+                            .new_workspace(NewWorkspaceRequest {
+                                name: Optional::Value("gtk".to_string()),
+                                ..Default::default()
+                            })
+                            .map(|_| ()),
+                        Ctl::Request(Value::Object(request)) => client.request_raw(request).map(|_| ()),
+                        Ctl::Request(_) => Ok(()),
+                    };
                     if let Err(error) = result {
-                        let _ = ui.send_blocking(UiMsg::Status(format!("new workspace failed: {error}")));
+                        let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -231,33 +298,74 @@ fn decode(data: &str) -> Vec<u8> {
     B64.decode(data).unwrap_or_default()
 }
 
-/// Flatten the protocol tree into sidebar rows. Works on JSON so the
-/// prototype only depends on the handful of fields it reads.
+/// Flatten the protocol tree. Works on JSON so the prototype depends only on
+/// the fields it reads. Only each workspace's active screen is modelled.
 fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
     let Some(list) = tree.get("workspaces").and_then(Value::as_array) else { return Vec::new() };
     list.iter()
         .map(|ws| {
             let screen = active(ws.get("screens"), |s| s.get("active").and_then(Value::as_bool) == Some(true));
-            let pane = screen.and_then(|screen| {
-                let want = screen.get("active_pane").and_then(Value::as_u64);
-                active(screen.get("panes"), |p| p.get("id").and_then(Value::as_u64) == want)
-            });
-            let tab = pane.and_then(|pane| {
-                let index = pane.get("active_tab").and_then(Value::as_u64).unwrap_or(0) as usize;
-                pane.get("tabs").and_then(Value::as_array).and_then(|tabs| tabs.get(index))
-            });
-            let surface = tab
-                .filter(|tab| tab.get("kind").and_then(Value::as_str) == Some("pty"))
-                .and_then(|tab| tab.get("surface").and_then(Value::as_u64));
+            let panes: Vec<Pane> = screen
+                .and_then(|s| s.get("panes"))
+                .and_then(Value::as_array)
+                .map(|panes| panes.iter().filter_map(parse_pane).collect())
+                .unwrap_or_default();
+            let active_pane = screen.and_then(|s| s.get("active_pane")).and_then(Value::as_u64);
+            let title = active_pane
+                .and_then(|id| panes.iter().find(|p| p.id == id))
+                .and_then(|p| p.tabs.get(p.active_tab))
+                .map(|t| t.title.clone())
+                .unwrap_or_default();
             Workspace {
                 id: ws.get("id").and_then(Value::as_u64).unwrap_or(0),
                 name: ws.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                 active: ws.get("active").and_then(Value::as_bool).unwrap_or(false),
-                surface,
-                title: tab.and_then(|t| t.get("title")).and_then(Value::as_str).unwrap_or("").to_string(),
+                title,
+                layout: screen.and_then(|s| s.get("layout")).and_then(parse_layout),
+                panes,
+                active_pane,
             }
         })
         .collect()
+}
+
+fn parse_pane(pane: &Value) -> Option<Pane> {
+    let tabs = pane
+        .get("tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| {
+                    Some(Tab {
+                        surface: tab.get("surface")?.as_u64()?,
+                        title: tab.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+                        terminal: tab.get("kind").and_then(Value::as_str) == Some("pty"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Pane {
+        id: pane.get("id")?.as_u64()?,
+        active_tab: pane.get("active_tab").and_then(Value::as_u64).unwrap_or(0) as usize,
+        tabs,
+    })
+}
+
+fn parse_layout(node: &Value) -> Option<Layout> {
+    match node.get("type")?.as_str()? {
+        "leaf" => Some(Layout::Leaf(node.get("pane")?.as_u64()?)),
+        "split" => Some(Layout::Split {
+            id: node.get("split").and_then(Value::as_u64),
+            right: node.get("dir").and_then(Value::as_str) == Some("right"),
+            ratio: node.get("ratio").and_then(Value::as_f64).unwrap_or(0.5),
+            a: Box::new(parse_layout(node.get("a")?)?),
+            b: Box::new(parse_layout(node.get("b")?)?),
+        }),
+        // A stack shows one expanded pane at a time.
+        "stack" => Some(Layout::Leaf(node.get("expanded")?.as_u64()?)),
+        _ => None,
+    }
 }
 
 /// The element matching `pred`, else the first one.
