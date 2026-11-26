@@ -170,7 +170,7 @@ Right-click the tab bar's `+` button: the menu lists every installed theme (plus
 
 ## Live pane re-theming
 
-Pane colors update without restarts, natively: a theme's `ghostty` section lands in `~/.config/ghostty/config`, cmux reads that file as its `terminal_defaults`, and the local patch pushes those defaults through the mux on every config reload — one broadcast repaints every live surface and becomes the default for panes created later. `cmux-theme set`/`cycle` and the `+` button's picker all trigger the same reload, so the whole of cmux — chrome and terminal panes — re-themes in one step.
+Pane colors update without restarts, natively: a theme's `ghostty` section lands in `~/.config/ghostty/config`, cmux reads that file as its `terminal_defaults`, and the local patch pushes those defaults through the mux on every config reload, both in a TUI that hosts its own session and in a headless `cmux server start` owner (upstream's headless reload re-read the config but kept the terminal colors it started with) — one broadcast repaints every live surface and becomes the default for panes created later. `cmux-theme set`/`cycle` and the `+` button's picker all trigger the same reload, so the whole of cmux — chrome and terminal panes — re-themes in one step.
 
 One inherent limit, by ANSI semantics: content painted in explicit truecolor (fastfetch logos, prompt segments with fixed hex) keeps its literal colors, as in any terminal emulator.
 

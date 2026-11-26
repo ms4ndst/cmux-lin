@@ -18,7 +18,7 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
 - keystrokes and pastes go to the pane you're typing in;
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
-- the whole window follows the active cmux theme: terminal colours (from the server) and the window's own chrome, meaning the header, sidebar, tab strips, menus and dividers, styled from the theme's chrome keys (`status_bg`/`status_fg`, `sidebar_active_bg`, `tab_bar_bg`/`tab_active_bg`, `menu_*`, `border_active` as the accent). It restyles live when the theme changes, whether from the ☰ menu, `cmux-theme` or the TUI;
+- the whole window follows the active cmux theme: terminal colours and the window's own chrome, meaning the header, sidebar, tab strips, menus and dividers, styled from the theme's chrome keys (`status_bg`/`status_fg`, `sidebar_active_bg`, `tab_bar_bg`/`tab_active_bg`, `menu_*`, `border_active` as the accent). It restyles live when the theme changes, whether from the ☰ menu, `cmux-theme` or the TUI;
 - each session gets its own window (app id `dev.cmuxlin.CmuxGtk.<session>`): `cmux-gtk --session work` opens beside the `main` window, and opening a session that already has a window brings that window up;
 - agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
 - the header's `+` creates a workspace, and the **☰ menu** has **Theme** (every installed cmux theme, the current one marked), the Workspaces/Files switch, and New / Rename / Close workspace. Right-click a workspace in the sidebar for Rename and Close;
@@ -126,7 +126,7 @@ If a tree poll fails, the window closes every attachment, dims itself and blocks
 
 A third connection subscribes to session events. `notification` events become desktop notifications, and tree, agent and notification events trigger an immediate re-poll of the tree and the agent roster (`list-agents`), so badges update within a moment rather than on the next 1.5 s poll.
 
-The protocol's colour messages carry foreground, background, cursor and selection, but the 16-colour palette only as per-terminal overrides. The theme's base palette comes from the same `~/.config/ghostty/config` block the server reads (written by `cmux-theme`).
+Terminal colours come from the active theme itself: the `~/.config/ghostty/config` block `cmux-theme` writes, which is also what the server loads. The window reads it directly and re-colours every terminal as soon as it changes, so a theme switch shows at once whatever colours the server is holding. A program's own colour changes (OSC 10/11/12 and OSC 4, which the server reports as overrides) still win. After that comes a legibility guard: text gets at least 4.5:1 contrast against the background and ANSI colours 1–15 at least 3:1, each nudged toward white or black only as far as needed, so a theme with low-contrast pairs stays readable. Colour 0 is left as is, because it's mostly used as a background. Colours a program prints in fixed RGB, such as powerline prompt segments, keep their literal values, as in any terminal.
 
 ## Not done
 

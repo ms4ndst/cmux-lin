@@ -349,6 +349,23 @@ index ca232683..646e9cf9 100644
      if let Some(dim) = raw.theme.dim_inactive {
          config.theme.dim_inactive = dim;
      }
+diff --git a/cmux-tui/crates/cmux-tui/src/main.rs b/cmux-tui/crates/cmux-tui/src/main.rs
+index 4012f326..a1872f34 100644
+--- a/cmux-tui/crates/cmux-tui/src/main.rs
++++ b/cmux-tui/crates/cmux-tui/src/main.rs
+@@ -2645,6 +2645,12 @@ fn start_local_owner_event_loop_with_completion(
+                     let request = mux.begin_config_reload_application();
+                     let config = config::load();
+                     session::apply_config_to_local_owner(&mux, &config);
++                    // cmux-lin: a headless owner (`cmux server start`) also
++                    // pushes the reloaded terminal defaults (the Ghostty block
++                    // cmux-theme writes) to every live surface, so a theme
++                    // switch recolours terminals for every attached client,
++                    // not only for an in-process TUI.
++                    mux.set_default_colors(config.terminal_defaults);
+                     if complete_reload {
+                         mux.complete_config_reload_application(request);
+                     }
 diff --git a/cmux-tui/crates/cmux-tui/src/ui/mod.rs b/cmux-tui/crates/cmux-tui/src/ui/mod.rs
 index 7c6ec253..cdd1b259 100644
 --- a/cmux-tui/crates/cmux-tui/src/ui/mod.rs

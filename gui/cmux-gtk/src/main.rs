@@ -94,6 +94,8 @@ struct PaneView {
     browser: bool,
     /// Whether that browser tab has been seen live on this attachment.
     browser_live: bool,
+    /// The last terminal colours the server sent (for its overrides).
+    server_colors: RefCell<Value>,
     /// The browser tab's stable id, for reading its selection.
     browser_tab: Option<String>,
     /// Intercepts the browser tab's file pickers (uploads).
@@ -168,7 +170,7 @@ struct State {
     /// The window's style sheet (chrome and badge colours follow the cmux
     /// theme), and the watch that restyles when the theme changes elsewhere.
     css: Option<gtk::CssProvider>,
-    _theme_watch: Option<gio::FileMonitor>,
+    _theme_watch: Vec<gio::FileMonitor>,
     /// The viewport-column row when the shown screen uses columns.
     viewport: Option<ViewportView>,
     /// Live pane views of the shown workspace, by pane id.
@@ -428,7 +430,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         ui: None,
         viewport: None,
         css: Some(provider.clone()),
-        _theme_watch: watch_theme(&provider),
+        _theme_watch: Vec::new(),
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -443,6 +445,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
         browser_problem: None,
     }));
     state.borrow_mut().ui = Some(ui.clone());
+    let watches = watch_theme(&state);
+    state.borrow_mut()._theme_watch = watches;
 
     // Files view requests act on the focused pane.
     *files_host_slot.borrow_mut() = Some(Rc::new({
@@ -775,25 +779,34 @@ fn full_css() -> String {
     format!("{CSS}{}{}", attention::css(), theme::chrome_css())
 }
 
-/// Restyle when the cmux config changes (a theme switched with
-/// `cmux-theme`, in the TUI, or from this window). Waits for writes to
-/// settle: `cmux-theme` rewrites the config and the Ghostty block.
-fn watch_theme(provider: &gtk::CssProvider) -> Option<gio::FileMonitor> {
-    let file = gio::File::for_path(theme::config_path()?);
-    let monitor = file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE).ok()?;
+/// Restyle the window and re-colour every terminal when the theme changes
+/// (switched with `cmux-theme`, in the TUI, or from this window). Watches the
+/// cmux config and the Ghostty colour block, and waits for writes to settle.
+fn watch_theme(state: &Shared) -> Vec<gio::FileMonitor> {
     let pending: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-    let provider = provider.clone();
-    monitor.connect_changed(move |_, _, _, _| {
-        if let Some(source) = pending.take() {
-            source.remove();
-        }
-        let (provider, pending_inner) = (provider.clone(), pending.clone());
-        pending.set(Some(glib::timeout_add_local_once(Duration::from_millis(500), move || {
-            pending_inner.set(None);
-            provider.load_from_string(&full_css());
-        })));
-    });
-    Some(monitor)
+    [theme::config_path(), theme::ghostty_config_path()]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            let monitor =
+                gio::File::for_path(path).monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE).ok()?;
+            let (state, pending) = (state.clone(), pending.clone());
+            monitor.connect_changed(move |_, _, _, _| {
+                if let Some(source) = pending.take() {
+                    source.remove();
+                }
+                let (state, pending_inner) = (state.clone(), pending.clone());
+                pending.set(Some(glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                    pending_inner.set(None);
+                    if let Some(css) = state.borrow().css.as_ref() {
+                        css.load_from_string(&full_css());
+                    }
+                    reapply_terminal_colors(&state);
+                })));
+            });
+            Some(monitor)
+        })
+        .collect()
 }
 
 /// Installed cmux themes (`~/.config/cmux/themes/*.json`), plus `default`.
@@ -2075,6 +2088,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         web,
         browser: false,
         browser_live: false,
+        server_colors: RefCell::new(Value::Null),
         browser_tab: None,
         uploads: None,
         attachment: None,
@@ -2677,8 +2691,9 @@ fn on_attach(state: &Shared, ui: &Ui, generation: u64, event: AttachEvent) {
         }
         AttachEvent::Replay { data, colors } => {
             if let Some(colors) = colors {
-                apply_colors(term, &colors);
+                *view.server_colors.borrow_mut() = colors;
             }
+            apply_colors(term, &view.server_colors.borrow());
             // VTE's reset keeps the visible screen, so clear screen and
             // scrollback before a replay.
             term.reset(true, true);
@@ -2686,73 +2701,103 @@ fn on_attach(state: &Shared, ui: &Ui, generation: u64, event: AttachEvent) {
             term.feed(&data);
         }
         AttachEvent::Output(data) => term.feed(&data),
-        AttachEvent::Colors(colors) => apply_colors(term, &colors),
+        AttachEvent::Colors(colors) => {
+            *view.server_colors.borrow_mut() = colors;
+            apply_colors(term, &view.server_colors.borrow());
+        }
         AttachEvent::Ended(reason) => ui.status.set_text(&reason),
     }
 }
 
-/// Apply the server's terminal colors (from a replay or colors-changed
-/// event) so the widget matches the active cmux theme.
-///
-/// The protocol carries fg/bg/cursor/selection, but its `palette` holds only
-/// sparse per-terminal overrides (OSC 4). The theme's base palette is the one
-/// the server itself loads from the Ghostty config, so read that same file;
-/// it is re-read on every colors event, so theme switches follow live.
-fn apply_colors(term: &vte4::Terminal, colors: &Value) {
-    let hex = |key: &str| colors.get(key).and_then(Value::as_str).and_then(|s| gdk::RGBA::parse(s).ok());
-    let overrides = colors.get("palette").and_then(Value::as_object);
-    let base = ghostty_palette();
+/// Colour a terminal widget: a program's own override (OSC 10/11/12, OSC 4)
+/// wins, then the active theme's colours (the Ghostty block `cmux-theme`
+/// writes, read here so a theme switch shows at once, whatever colours the
+/// server started with), then the server's. Then make it legible: text
+/// gets at least 4.5:1 contrast against the background and ANSI colours
+/// 1-15 at least 3:1, nudged toward white or black where a theme falls
+/// short (colour 0 is left alone: it's mostly used as a background).
+fn apply_colors(term: &vte4::Terminal, server: &Value) {
+    let theme = theme::terminal_colors();
+    let override_of = |key: &str| {
+        server.get("overrides").and_then(|o| o.get(key)).and_then(Value::as_str).map(str::to_string)
+    };
+    let from_server = |key: &str| server.get(key).and_then(Value::as_str).map(str::to_string);
+    let pick = |key: &str, theme_value: &Option<String>| {
+        override_of(key).or_else(|| theme_value.clone()).or_else(|| from_server(key))
+    };
+    let parse = |hex: Option<String>| hex.and_then(|h| gdk::RGBA::parse(&h).ok());
+
+    let bg = parse(pick("bg", &theme.background)).unwrap_or_else(|| gdk::RGBA::new(0.0, 0.0, 0.0, 1.0));
+    let fg = parse(pick("fg", &theme.foreground)).unwrap_or_else(|| gdk::RGBA::new(0.9, 0.9, 0.9, 1.0));
+    let fg = ensure_contrast(&fg, &bg, 4.5);
+
+    let overrides = server.get("palette").and_then(Value::as_object);
     let defaults = [
         "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
         "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
     ];
     let palette: Vec<gdk::RGBA> = (0..16)
         .map(|i| {
-            let from_override = overrides
+            let color = overrides
                 .and_then(|m| m.get(&i.to_string()))
                 .and_then(Value::as_str)
-                .and_then(|s| gdk::RGBA::parse(s).ok());
-            from_override
-                .or_else(|| base[i].clone())
-                .unwrap_or_else(|| gdk::RGBA::parse(defaults[i]).expect("valid default color"))
+                .map(str::to_string)
+                .or_else(|| theme.palette[i].clone());
+            let color = parse(color).unwrap_or_else(|| gdk::RGBA::parse(defaults[i]).expect("valid default"));
+            if i == 0 { color } else { ensure_contrast(&color, &bg, 3.0) }
         })
         .collect();
     let refs: Vec<&gdk::RGBA> = palette.iter().collect();
-    term.set_colors(hex("fg").as_ref(), hex("bg").as_ref(), &refs);
-    if let Some(cursor) = hex("cursor") {
+    term.set_colors(Some(&fg), Some(&bg), &refs);
+    if let Some(cursor) = parse(pick("cursor", &theme.cursor)) {
         term.set_color_cursor(Some(&cursor));
     }
-    if let Some(selection) = hex("selection_bg") {
+    if let Some(selection) = parse(theme.selection_background.clone().or_else(|| from_server("selection_bg"))) {
         term.set_color_highlight(Some(&selection));
     }
-    if let Some(selection) = hex("selection_fg") {
-        term.set_color_highlight_foreground(Some(&selection));
-    }
+    let selection_fg = parse(theme.selection_foreground.clone().or_else(|| from_server("selection_fg")));
+    term.set_color_highlight_foreground(selection_fg.as_ref());
 }
 
-/// `palette = N=#rrggbb` entries 0-15 from the Ghostty config (last wins),
-/// i.e. the block `cmux-theme` maintains.
-fn ghostty_palette() -> Vec<Option<gdk::RGBA>> {
-    let mut out = vec![None; 16];
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    let Some(text) = dir.and_then(|dir| std::fs::read_to_string(dir.join("ghostty/config")).ok()) else {
-        return out;
+/// WCAG relative luminance.
+fn luminance(c: &gdk::RGBA) -> f64 {
+    let channel = |v: f32| {
+        let v = f64::from(v);
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
     };
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
-        if key.trim() != "palette" {
-            continue;
-        }
-        let Some((index, color)) = value.trim().split_once('=') else { continue };
-        if let (Ok(index), Ok(rgba)) = (index.trim().parse::<usize>(), gdk::RGBA::parse(color.trim())) {
-            if index < 16 {
-                out[index] = Some(rgba);
-            }
+    0.2126 * channel(c.red()) + 0.7152 * channel(c.green()) + 0.0722 * channel(c.blue())
+}
+
+/// WCAG contrast ratio, 1 to 21.
+fn contrast(a: &gdk::RGBA, b: &gdk::RGBA) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `color` if it already has `minimum` contrast against `background`;
+/// otherwise the least mix toward white (dark background) or black (light
+/// background) that does, keeping as much of the theme's hue as possible.
+fn ensure_contrast(color: &gdk::RGBA, background: &gdk::RGBA, minimum: f64) -> gdk::RGBA {
+    if contrast(color, background) >= minimum {
+        return *color;
+    }
+    let target = if luminance(background) < 0.18 { 1.0 } else { 0.0 };
+    for step in 1..=20 {
+        let t = step as f32 / 20.0;
+        let mix = |v: f32| v + (target - v) * t;
+        let candidate = gdk::RGBA::new(mix(color.red()), mix(color.green()), mix(color.blue()), 1.0);
+        if contrast(&candidate, background) >= minimum {
+            return candidate;
         }
     }
-    out
+    gdk::RGBA::new(target, target, target, 1.0)
+}
+
+/// Re-colour every terminal (after a theme change).
+fn reapply_terminal_colors(state: &Shared) {
+    for view in state.borrow().panes.values() {
+        apply_colors(&view.term, &view.server_colors.borrow());
+    }
 }
 
 fn snapshot_png(window: &gtk::ApplicationWindow, path: &std::ffi::OsStr) -> Result<(), String> {

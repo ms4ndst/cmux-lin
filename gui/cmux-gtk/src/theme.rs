@@ -139,3 +139,52 @@ pub fn chrome_css() -> String {
     }
     css
 }
+
+/// The terminal colours the theme defines: the Ghostty colour block that
+/// `cmux-theme` writes (and the server would load at start).
+#[derive(Debug, Default, Clone)]
+pub struct TerminalColors {
+    pub background: Option<String>,
+    pub foreground: Option<String>,
+    pub cursor: Option<String>,
+    pub selection_background: Option<String>,
+    pub selection_foreground: Option<String>,
+    pub palette: [Option<String>; 16],
+}
+
+/// Read the theme's terminal colours (last value of each key wins, as in
+/// Ghostty).
+pub fn terminal_colors() -> TerminalColors {
+    let mut colors = TerminalColors::default();
+    let Some(text) = config_dir().and_then(|dir| std::fs::read_to_string(dir.join("ghostty/config")).ok()) else {
+        return colors;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "background" => colors.background = Some(value),
+            "foreground" => colors.foreground = Some(value),
+            "cursor-color" => colors.cursor = Some(value),
+            "selection-background" => colors.selection_background = Some(value),
+            "selection-foreground" => colors.selection_foreground = Some(value),
+            "palette" => {
+                if let Some((index, color)) = value.split_once('=') {
+                    if let Ok(index) = index.trim().parse::<usize>() {
+                        if index < 16 {
+                            colors.palette[index] = Some(color.trim().to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    colors
+}
+
+/// The terminal config the server reads (watched with the cmux config, so a
+/// theme switch recolours terminals even if only this file changed).
+pub fn ghostty_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("ghostty/config"))
+}
