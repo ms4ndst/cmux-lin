@@ -7,6 +7,10 @@
 //! own byte-mode attachment (VT replay, then live output); keystrokes and the
 //! widget's cell grid go back over that same attachment.
 //!
+//! Agent attention (blocked / finished / unread notification / working) is
+//! shown as badges on tabs and sidebar rows; notifications also go to the
+//! desktop, and clicking one jumps to its tab.
+//!
 //! Layout actions (new tab, split, close, select tab, divider drags) are
 //! sent to the server; the window only redraws from the tree the server
 //! reports back, so it never diverges from the TUI.
@@ -16,6 +20,7 @@
 //! Debug: CMUX_GTK_SNAPSHOT=/abs/path.png renders the window to a PNG every
 //! 2 s; CMUX_GTK_DEBUG=1 logs size reports.
 
+mod attention;
 mod backend;
 
 use std::cell::{Cell, RefCell};
@@ -25,9 +30,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use backend::{AttachEvent, Attachment, Ctl, Layout, Pane, UiMsg, Workspace};
+use attention::Attn;
+use backend::{Agents, AttachEvent, Attachment, Ctl, Layout, Pane, UiMsg, Workspace};
 use gtk::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 use serde_json::{Value, json};
 use vte4::prelude::*;
 
@@ -52,8 +58,8 @@ struct PaneView {
     /// Unique per attachment; routes attach events to this pane.
     generation: u64,
     reported: Option<(u16, u16)>,
-    /// The pane state the tab strip was last drawn from.
-    drawn: Option<Pane>,
+    /// The pane state and tab attention the tab strip was last drawn from.
+    drawn: Option<(Pane, Vec<Option<Attn>>)>,
 }
 
 impl PaneView {
@@ -89,6 +95,16 @@ struct State {
     /// move them without a rebuild.
     splits: HashMap<u64, SplitView>,
     next_generation: u64,
+    /// Agent status by surface, from the last poll.
+    agents: Agents,
+    /// What was last acknowledged per surface, so each finished turn or
+    /// unread marker is acknowledged once.
+    acked: HashMap<u64, String>,
+    window: glib::WeakRef<gtk::ApplicationWindow>,
+    app: glib::WeakRef<gtk::Application>,
+    /// When a notification was last shown in the status line; the workspace
+    /// summary doesn't overwrite it for a few seconds.
+    noted_at: Option<std::time::Instant>,
 }
 
 impl State {
@@ -153,7 +169,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     };
 
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
+    provider.load_from_string(&format!("{CSS}{}", attention::css()));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
@@ -218,6 +234,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let (ctl_tx, ctl_rx) = mpsc::channel::<Ctl>();
     let socket_path = config.socket_path.clone();
     backend::spawn_control(config, ctl_rx, ui_tx.clone());
+    backend::spawn_events(socket_path.clone(), ctl_tx.clone(), ui_tx.clone());
 
     let state: Shared = Rc::new(RefCell::new(State {
         socket_path,
@@ -230,6 +247,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
         focused: None,
         splits: HashMap::new(),
         next_generation: 0,
+        agents: Agents::new(),
+        acked: HashMap::new(),
+        window: window.downgrade(),
+        app: app.downgrade(),
+        noted_at: None,
     }));
 
     new_ws.connect_clicked({
@@ -284,7 +306,13 @@ fn build_ui(app: &gtk::Application, session: &str) {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
                     UiMsg::Disconnected(reason) => on_disconnected(&state, &ui, &reason),
-                    UiMsg::Tree(workspaces) => on_tree(&state, &ui, workspaces),
+                    UiMsg::Tree(workspaces, agents) => {
+                        state.borrow_mut().agents = agents;
+                        on_tree(&state, &ui, workspaces);
+                    }
+                    UiMsg::Notification { id, title, body, level, surface } => {
+                        on_notification(&state, &ui, id, &title, &body, &level, surface);
+                    }
                     UiMsg::Status(text) => ui.status.set_text(&text),
                     UiMsg::Attach { generation, event } => on_attach(&state, &ui, generation, event),
                 }
@@ -301,6 +329,25 @@ fn build_ui(app: &gtk::Application, session: &str) {
             glib::Propagation::Proceed
         }
     });
+
+    // Coming back to the window counts as seeing what it shows.
+    window.connect_is_active_notify({
+        let state = state.clone();
+        move |_| ack_seen(&state)
+    });
+
+    // Clicking a desktop notification activates `app.show-surface`.
+    let show_surface = gio::SimpleAction::new("show-surface", Some(glib::VariantTy::UINT64));
+    show_surface.connect_activate({
+        let state = state.clone();
+        let ui = ui.clone();
+        move |_, parameter| {
+            if let Some(surface) = parameter.and_then(|p| p.get::<u64>()) {
+                show_surface_tab(&state, &ui, surface);
+            }
+        }
+    });
+    app.add_action(&show_surface);
 
     window.present();
 
@@ -410,7 +457,8 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
         ui.list.remove(&child);
     }
     for ws in &workspaces {
-        ui.list.append(&sidebar_row(ws));
+        let row = sidebar_row(ws, &state.borrow().agents);
+        ui.list.append(&row);
     }
     if let Some(row) = target.and_then(|i| ui.list.row_at_index(i as i32)) {
         ui.list.select_row(Some(&row));
@@ -418,7 +466,7 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     render(state, ui);
 }
 
-fn sidebar_row(ws: &Workspace) -> gtk::Box {
+fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
     let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
     let title = gtk::Label::new(Some(&name));
     title.set_xalign(0.0);
@@ -433,7 +481,21 @@ fn sidebar_row(ws: &Workspace) -> gtk::Box {
     column.set_margin_start(6);
     column.append(&title);
     column.append(&subtitle);
-    column
+    column.set_hexpand(true);
+
+    // The workspace's most urgent state, and how many tabs need you.
+    let states: Vec<Attn> =
+        ws.panes.iter().flat_map(|p| &p.tabs).filter_map(|t| attention::of_tab(t, agents)).collect();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&column);
+    if let Some(top) = states.iter().copied().max() {
+        let count = states.iter().filter(|a| a.needs_you()).count();
+        let badge = attention::badge(top, count);
+        badge.set_valign(gtk::Align::Center);
+        badge.set_margin_end(6);
+        row.append(&badge);
+    }
+    row
 }
 
 /// Bring the content area in line with the selected workspace: rebuild the
@@ -474,6 +536,11 @@ fn render(state: &Shared, ui: &Ui) {
         }
     }
     update_focus_marks(state);
+    let noted = state.borrow().noted_at.is_some_and(|at| at.elapsed() < Duration::from_secs(6));
+    if noted {
+        ack_seen(state);
+        return;
+    }
     let name = if ws.name.is_empty() { format!("workspace {}", ws.id) } else { ws.name.clone() };
     let panes = ws.panes.len();
     let tabs: usize = ws.panes.iter().map(|p| p.tabs.len()).sum();
@@ -482,6 +549,7 @@ fn render(state: &Shared, ui: &Ui) {
         if panes == 1 { "" } else { "s" },
         if tabs == 1 { "" } else { "s" }
     ));
+    ack_seen(state);
 }
 
 fn clear_content(state: &Shared, ui: &Ui) {
@@ -670,11 +738,16 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
 /// Redraw a pane's tab strip if its tabs changed, and attach to its active
 /// tab if that changed.
 fn refresh_pane(state: &Shared, pane: &Pane) {
-    let needs_tabbar = state.borrow().panes[&pane.id].drawn.as_ref() != Some(pane);
+    let marks: Vec<Option<Attn>> = {
+        let st = state.borrow();
+        pane.tabs.iter().map(|t| attention::of_tab(t, &st.agents)).collect()
+    };
+    let drawn = (pane.clone(), marks);
+    let needs_tabbar = state.borrow().panes[&pane.id].drawn.as_ref() != Some(&drawn);
     if needs_tabbar {
         let tabbar = state.borrow().panes[&pane.id].tabbar.clone();
-        draw_tabbar(state, &tabbar, pane);
-        state.borrow_mut().panes.get_mut(&pane.id).expect("pane view").drawn = Some(pane.clone());
+        draw_tabbar(state, &tabbar, pane, &drawn.1);
+        state.borrow_mut().panes.get_mut(&pane.id).expect("pane view").drawn = Some(drawn);
     }
 
     let surface = pane.surface();
@@ -709,7 +782,7 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
     }
 }
 
-fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane) {
+fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<Attn>]) {
     while let Some(child) = tabbar.first_child() {
         tabbar.remove(&child);
     }
@@ -722,10 +795,20 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane) {
         let label = gtk::Label::new(Some(&title));
         label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         label.set_max_width_chars(24);
+        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let mark = marks.get(index).copied().flatten();
+        if let Some(attn) = mark {
+            inner.append(&attention::badge(attn, 1));
+        }
+        inner.append(&label);
         let button = gtk::Button::new();
-        button.set_child(Some(&label));
+        button.set_child(Some(&inner));
         button.add_css_class("flat");
-        button.set_tooltip_text(Some(&title));
+        let tooltip = match mark {
+            Some(attn) => format!("{title}\n{}", attn.describe()),
+            None => title.clone(),
+        };
+        button.set_tooltip_text(Some(&tooltip));
         if index == pane.active_tab {
             button.add_css_class("tab-active");
         }
@@ -780,6 +863,97 @@ fn update_focus_marks(state: &Shared) {
         } else {
             view.root.remove_css_class("focused");
         }
+    }
+}
+
+/// Acknowledge what the person can see: the active tab of every shown pane,
+/// while the window has focus. That clears its unread marker and turns a
+/// finished agent turn (`done`) into `idle`, as the TUI does for the tab it
+/// shows. Each state is acknowledged once.
+fn ack_seen(state: &Shared) {
+    let mut st = state.borrow_mut();
+    if !st.window.upgrade().is_some_and(|w| w.is_active()) {
+        return;
+    }
+    let Some(ws) = st.workspace().cloned() else { return };
+    let mut to_ack = Vec::new();
+    for pane in &ws.panes {
+        let Some(tab) = pane.tabs.get(pane.active_tab) else { continue };
+        if !st.panes.contains_key(&pane.id) {
+            continue;
+        }
+        let done = st.agents.get(&tab.surface).is_some_and(|s| s == "done");
+        if !done && tab.unread.is_none() {
+            st.acked.remove(&tab.surface);
+            continue;
+        }
+        let token = format!("{done}:{:?}", tab.unread);
+        if st.acked.get(&tab.surface) != Some(&token) {
+            st.acked.insert(tab.surface, token);
+            to_ack.push(tab.surface);
+        }
+    }
+    for surface in to_ack {
+        if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+            eprintln!("cmux-gtk: ack surface {surface}");
+        }
+        st.send(Ctl::request(json!({ "cmd": "ack-tab-notifications", "surface": surface })));
+    }
+}
+
+/// A notification arrived: note it in the status line, and post it to the
+/// desktop unless the person is already looking at that terminal.
+fn on_notification(state: &Shared, ui: &Ui, id: u64, title: &str, body: &str, level: &str, surface: Option<u64>) {
+    let line = if body.is_empty() { title.to_string() } else { format!("{title} — {body}") };
+    ui.status.set_text(&format!("🔔 {line}"));
+    state.borrow_mut().noted_at = Some(std::time::Instant::now());
+
+    let st = state.borrow();
+    let window_active = st.window.upgrade().is_some_and(|w| w.is_active());
+    let visible = surface.is_some_and(|s| st.panes.values().any(|v| v.surface == Some(s)));
+    if window_active && visible {
+        return;
+    }
+    let Some(app) = st.app.upgrade() else { return };
+    let notification = gio::Notification::new(if title.is_empty() { "cmux" } else { title });
+    if !body.is_empty() {
+        notification.set_body(Some(body));
+    }
+    notification.set_priority(match level {
+        "error" => gio::NotificationPriority::Urgent,
+        "warning" => gio::NotificationPriority::High,
+        _ => gio::NotificationPriority::Normal,
+    });
+    if let Some(surface) = surface {
+        notification.set_default_action_and_target_value("app.show-surface", Some(&surface.to_variant()));
+    }
+    app.send_notification(Some(&format!("cmux-{id}")), &notification);
+}
+
+/// Jump to the tab showing `surface`: select its workspace here, make it the
+/// active tab and pane on the server, and raise the window.
+fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
+    let found = state.borrow().workspaces.iter().find_map(|ws| {
+        ws.panes.iter().find_map(|pane| {
+            let index = pane.tabs.iter().position(|t| t.surface == surface)?;
+            Some((ws.id, pane.id, index))
+        })
+    });
+    let Some((ws_id, pane_id, index)) = found else { return };
+    {
+        let mut st = state.borrow_mut();
+        st.selected = Some(ws_id);
+        st.focused = Some(pane_id);
+        st.send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane_id, "index": index })));
+        st.send(Ctl::request(json!({ "cmd": "focus-pane", "pane": pane_id })));
+    }
+    let position = state.borrow().workspaces.iter().position(|w| w.id == ws_id);
+    if let Some(row) = position.and_then(|i| ui.list.row_at_index(i as i32)) {
+        ui.list.select_row(Some(&row));
+    }
+    render(state, ui);
+    if let Some(window) = state.borrow().window.upgrade() {
+        window.present();
     }
 }
 

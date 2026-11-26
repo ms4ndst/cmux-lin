@@ -2,7 +2,11 @@
 //!
 //! Two kinds of worker talk to the session socket:
 //! - one control thread (upstream's Rust SDK) polls the workspace tree and
-//!   runs layout commands (new workspace/tab, split, select, close);
+//!   agent roster and runs layout commands (new workspace/tab, split,
+//!   select, close, acknowledge);
+//! - one event thread subscribes to session events: notifications become
+//!   [`UiMsg::Notification`], and tree/agent/notification events make the
+//!   control thread re-poll at once;
 //! - one [`Attachment`] per viewed terminal owns a byte-mode attach
 //!   connection. Its reader forwards the VT replay and live output to the UI;
 //!   its writer sends input and size reports **on that same connection**.
@@ -90,7 +94,15 @@ pub struct Tab {
     pub surface: u64,
     pub title: String,
     pub terminal: bool,
+    /// Level of an unread notification on this tab (`info`, `warning`,
+    /// `error`); cleared when the tab is selected or acknowledged.
+    pub unread: Option<String>,
 }
+
+/// Agent status per terminal surface, in `list-agents`' one-vocabulary
+/// `status` form: `blocked`, `done` (finished a turn nobody has seen yet),
+/// `working`, `idle`, `unknown`.
+pub type Agents = std::collections::HashMap<u64, String>;
 
 /// Messages from workers to the UI.
 pub enum UiMsg {
@@ -98,7 +110,9 @@ pub enum UiMsg {
     Connected,
     /// The session stopped answering; the control thread keeps retrying.
     Disconnected(String),
-    Tree(Vec<Workspace>),
+    Tree(Vec<Workspace>, Agents),
+    /// A posted notification (from `notify`, an agent hook, or the mux).
+    Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
     /// Output for the attachment with this `generation` (unique across all
     /// panes); events from replaced attachments are dropped by the UI.
     Attach { generation: u64, event: AttachEvent },
@@ -116,6 +130,8 @@ pub enum AttachEvent {
 /// Requests from the UI to the control thread.
 pub enum Ctl {
     NewWorkspace,
+    /// Re-poll now (sent by the event thread when something changed).
+    Poke,
     /// Any protocol command as a JSON object with `cmd` (e.g. `split`,
     /// `new-tab`, `select-tab`, `close-surface`, `focus-pane`).
     Request(Value),
@@ -176,46 +192,115 @@ enum Served {
 
 /// Poll and run requests on one connection until it fails.
 fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiMsg>) -> Served {
-    let mut last: Option<Vec<Workspace>> = None;
+    let mut last: Option<(Vec<Workspace>, Agents)> = None;
     loop {
-        match client.workspace_tree() {
-            Ok(tree) => {
-                let workspaces =
-                    serde_json::to_value(&tree).map(|value| parse_workspaces(&value)).unwrap_or_default();
+        let snapshot = client.workspace_tree().and_then(|tree| {
+            let workspaces =
+                serde_json::to_value(&tree).map(|value| parse_workspaces(&value)).unwrap_or_default();
+            Ok((workspaces, list_agents(client)?))
+        });
+        match snapshot {
+            Ok(snapshot) => {
                 if last.is_none() && ui.send_blocking(UiMsg::Connected).is_err() {
                     return Served::UiGone;
                 }
-                if last.as_ref() != Some(&workspaces) {
-                    last = Some(workspaces.clone());
-                    if ui.send_blocking(UiMsg::Tree(workspaces)).is_err() {
+                if last.as_ref() != Some(&snapshot) {
+                    last = Some(snapshot.clone());
+                    if ui.send_blocking(UiMsg::Tree(snapshot.0, snapshot.1)).is_err() {
                         return Served::UiGone;
                     }
                 }
             }
             Err(error) => return Served::Lost { reason: error.to_string(), was_up: last.is_some() },
         }
-        // Wait for a request or the next poll. After a request, loop
-        // straight back to re-read the tree so the UI updates at once.
-        match rx.recv_timeout(TREE_POLL) {
-            Ok(ctl) => {
-                let result = match ctl {
-                    Ctl::NewWorkspace => client
-                        .new_workspace(NewWorkspaceRequest {
-                            name: Optional::Value("gtk".to_string()),
-                            ..Default::default()
-                        })
-                        .map(|_| ()),
-                    Ctl::Request(Value::Object(request)) => client.request_raw(request).map(|_| ()),
-                    Ctl::Request(_) => Ok(()),
-                };
-                if let Err(error) = result {
-                    let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
+        // Wait for a request or the next poll. Run everything queued (a burst
+        // of events coalesces into one re-poll), then loop straight back to
+        // re-read the tree so the UI updates at once.
+        let first = match rx.recv_timeout(TREE_POLL) {
+            Ok(ctl) => ctl,
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Served::UiGone,
+        };
+        for ctl in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            let result = match ctl {
+                Ctl::Poke => Ok(()),
+                Ctl::NewWorkspace => client
+                    .new_workspace(NewWorkspaceRequest {
+                        name: Optional::Value("gtk".to_string()),
+                        ..Default::default()
+                    })
+                    .map(|_| ()),
+                Ctl::Request(Value::Object(request)) => client.request_raw(request).map(|_| ()),
+                Ctl::Request(_) => Ok(()),
+            };
+            if let Err(error) = result {
+                let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
+            }
         }
     }
+}
+
+/// The agent roster as surface → status. `status` is the vocabulary every
+/// client shows; older daemons only send `state`.
+fn list_agents(client: &mut Client) -> Result<Agents, Error> {
+    let mut request = serde_json::Map::new();
+    request.insert("cmd".into(), json!("list-agents"));
+    let response = client.request_raw(request)?;
+    let list = response.get("agents").or_else(|| response.pointer("/data/agents"));
+    Ok(list
+        .and_then(Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|agent| {
+                    let surface = agent.get("surface")?.as_u64()?;
+                    let status = agent.get("status").and_then(Value::as_str).or_else(|| agent.get("state")?.as_str())?;
+                    Some((surface, status.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Event thread: subscribe to session events, reconnecting forever.
+pub fn spawn_events(socket_path: PathBuf, ctl: mpsc::Sender<Ctl>, ui: async_channel::Sender<UiMsg>) {
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(socket) = UnixStream::connect(&socket_path) {
+                let mut writer = socket.try_clone().ok();
+                let subscribed = writer
+                    .as_mut()
+                    .is_some_and(|w| w.write_all(b"{\"id\":1,\"cmd\":\"subscribe\"}\n").is_ok());
+                if subscribed {
+                    for line in BufReader::new(socket).lines() {
+                        let Ok(line) = line else { break };
+                        let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+                        let name = event.get("event").and_then(Value::as_str).unwrap_or("");
+                        if name == "notification" {
+                            let text = |key: &str| event.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+                            let message = UiMsg::Notification {
+                                id: event.get("notification").and_then(Value::as_u64).unwrap_or(0),
+                                title: text("title"),
+                                body: text("body"),
+                                level: text("level"),
+                                surface: event.get("surface").and_then(Value::as_u64),
+                            };
+                            if ui.send_blocking(message).is_err() {
+                                return;
+                            }
+                        }
+                        if matches!(name, "notification" | "tree-changed" | "agent-changed") && ctl.send(Ctl::Poke).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            if ui.is_closed() {
+                return;
+            }
+            std::thread::sleep(RETRY);
+        }
+    });
 }
 
 /// Sleep for `wait`, discarding requests that arrive meanwhile. Returns false
@@ -390,10 +475,14 @@ fn parse_pane(pane: &Value) -> Option<Pane> {
         .map(|tabs| {
             tabs.iter()
                 .filter_map(|tab| {
+                    let marker = tab.get("notification").filter(|m| m.is_object());
                     Some(Tab {
                         surface: tab.get("surface")?.as_u64()?,
                         title: tab.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
                         terminal: tab.get("kind").and_then(Value::as_str) == Some("pty"),
+                        unread: marker
+                            .filter(|m| m.get("unread").and_then(Value::as_bool) != Some(false))
+                            .map(|m| m.get("level").and_then(Value::as_str).unwrap_or("info").to_string()),
                     })
                 })
                 .collect()

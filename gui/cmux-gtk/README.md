@@ -11,10 +11,28 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - keystrokes and pastes go to the pane you're typing in, and focusing a pane makes it the session's active pane;
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
 - terminal colours follow the active cmux theme;
+- agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
 - the header's `+` creates a workspace;
 - if the session stops or restarts, the window dims and waits, then reconnects by itself and re-attaches every pane (it can also be started before the session exists).
 
 All layout changes are requests to the server; the window only redraws from the tree the server reports back, so it can't drift from the TUI.
+
+## Agent attention and notifications
+
+Each tab gets a mark, ranked most urgent first the same way every cmux client ranks them:
+
+| Mark | Meaning |
+|---|---|
+| red `●` | an agent is waiting for you (blocked) |
+| `✓` | an agent finished a turn you haven't looked at yet |
+| `●` in the level's colour | an unread notification (error, warning, info) |
+| `◐` | an agent is working |
+
+Each sidebar row shows its workspace's most urgent mark and how many tabs need you. Colours come from the active cmux theme's notification colours.
+
+When a tab with a finished turn or an unread notification is on screen and the window has focus, the app tells the server you've seen it (`ack-tab-notifications`), the same way the TUI does. That clears the mark everywhere, TUI included.
+
+Notifications also go to the desktop notification service (dunst, GNOME Shell and so on), unless you're already looking at that terminal. Clicking one jumps to its tab. The latest notification also shows in the status line for a few seconds.
 
 ## Keyboard shortcuts
 
@@ -47,6 +65,8 @@ That last part is a protocol rule: the server sizes a terminal from its attached
 
 If a tree poll fails, the window closes every attachment, dims itself and blocks input, and the control thread retries the socket every second. When a tree can be read again, each pane re-attaches and gets a fresh screen replay. Pane widgets are reused by pane id, so a restart that keeps the layout doesn't rebuild anything; shells running in the session survive a server restart.
 
+A third connection subscribes to session events. `notification` events become desktop notifications, and tree, agent and notification events trigger an immediate re-poll of the tree and the agent roster (`list-agents`), so badges update within a moment rather than on the next 1.5 s poll.
+
 The protocol's colour messages carry foreground, background, cursor and selection, but the 16-colour palette only as per-terminal overrides. The theme's base palette comes from the same `~/.config/ghostty/config` block the server reads (written by `cmux-theme`).
 
 ## Not done
@@ -55,7 +75,6 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 - switching workspaces on the server when you click one (the click is local);
 - browser tabs (listed in the tab strip, but not rendered);
 - zoom, pane swap, and other layout commands beyond split/close;
-- agent attention badges and desktop notifications;
 
 ## Debugging
 
