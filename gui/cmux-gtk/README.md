@@ -18,7 +18,8 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
 - keystrokes and pastes go to the pane you're typing in;
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
-- terminal colours follow the active cmux theme;
+- the whole window follows the active cmux theme: terminal colours (from the server) and the window's own chrome, meaning the header, sidebar, tab strips, menus and dividers, styled from the theme's chrome keys (`status_bg`/`status_fg`, `sidebar_active_bg`, `tab_bar_bg`/`tab_active_bg`, `menu_*`, `border_active` as the accent). It restyles live when the theme changes, whether from the ☰ menu, `cmux-theme` or the TUI;
+- each session gets its own window (app id `dev.cmuxlin.CmuxGtk.<session>`): `cmux-gtk --session work` opens beside the `main` window, and opening a session that already has a window brings that window up;
 - agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
 - the header's `+` creates a workspace, and the **☰ menu** has **Theme** (every installed cmux theme, the current one marked), the Workspaces/Files switch, and New / Rename / Close workspace. Right-click a workspace in the sidebar for Rename and Close;
 - **closing ends the shells**: closing a tab (`×`, `Ctrl+Shift+W`), a pane (pane menu), a screen (`×` on the screen strip) or a workspace also ends the shells it held, via `close-terminal`. The server's own close commands only remove the layout, which would leave the shells running unseen in the session (the TUI behaves that way). A single tab closes at once; a pane or screen with two or more shells, and any workspace, asks first and says how many will end;

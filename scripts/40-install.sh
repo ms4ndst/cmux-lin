@@ -24,13 +24,16 @@ else
 fi
 
 # GTK app (if built): binary plus a launcher entry. The desktop file is
-# named after the app id, which desktop notifications refer to.
+# named after the app id (dev.cmuxlin.CmuxGtk.<session>), which desktop
+# notifications refer to.
 GTK_APP="$REPO_ROOT/gui/cmux-gtk/target/release/cmux-gtk"
 if [ -x "$GTK_APP" ]; then
   install -m 0755 "$GTK_APP" "$DEST/cmux-gtk"
   APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$APPS_DIR"
-  cat > "$APPS_DIR/dev.cmuxlin.CmuxGtk.desktop" <<DESKTOP
+  # The app id is per session; the launcher opens "main".
+  rm -f "$APPS_DIR/dev.cmuxlin.CmuxGtk.desktop"  # pre-per-session name
+  cat > "$APPS_DIR/dev.cmuxlin.CmuxGtk.main.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=cmux
@@ -41,10 +44,10 @@ Icon=utilities-terminal
 Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;multiplexer;agents;tmux;
-StartupWMClass=dev.cmuxlin.CmuxGtk
+StartupWMClass=dev.cmuxlin.CmuxGtk.main
 DESKTOP
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$APPS_DIR" || true
-  log "installed cmux-gtk and its launcher entry ($APPS_DIR/dev.cmuxlin.CmuxGtk.desktop)"
+  log "installed cmux-gtk and its launcher entry ($APPS_DIR/dev.cmuxlin.CmuxGtk.main.desktop)"
 fi
 
 CONFIG_SRC="$REPO_ROOT/assets/cmux-tui.json"

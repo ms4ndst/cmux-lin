@@ -29,6 +29,7 @@ mod attention;
 mod backend;
 mod browser;
 mod files;
+mod theme;
 
 use cmux_browser_provider as provider;
 
@@ -46,7 +47,21 @@ use gtk::{gdk, gio, glib};
 use serde_json::{Value, json};
 use vte4::prelude::*;
 
+/// Base application id; each session gets its own (`<base>.<session>`), so
+/// every session has its own window, opening a session again raises its
+/// window, and windows for different sessions never hand off to each other.
 const APP_ID: &str = "dev.cmuxlin.CmuxGtk";
+
+/// `dev.cmuxlin.CmuxGtk.<session>`, with the session name made a valid
+/// application id element (letters, digits, `_`; not starting with a digit).
+fn app_id_for(session: &str) -> String {
+    let mut element: String =
+        session.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    if element.is_empty() || element.starts_with(|c: char| c.is_ascii_digit()) {
+        element.insert(0, 's');
+    }
+    format!("{APP_ID}.{element}")
+}
 
 const CSS: &str = "
 .pane-tabs { padding: 2px 4px; }
@@ -150,8 +165,10 @@ struct State {
     raw: Vec<Workspace>,
     /// Widgets, for handlers that change the selection and redraw.
     ui: Option<Ui>,
-    /// The window's style sheet (badge colours follow the cmux theme).
+    /// The window's style sheet (chrome and badge colours follow the cmux
+    /// theme), and the watch that restyles when the theme changes elsewhere.
     css: Option<gtk::CssProvider>,
+    _theme_watch: Option<gio::FileMonitor>,
     /// The viewport-column row when the shown screen uses columns.
     viewport: Option<ViewportView>,
     /// Live pane views of the shown workspace, by pane id.
@@ -219,7 +236,7 @@ type Shared = Rc<RefCell<State>>;
 
 fn main() -> glib::ExitCode {
     let session = parse_session();
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    let app = gtk::Application::builder().application_id(app_id_for(&session)).build();
     app.connect_activate(move |app| build_ui(app, &session));
     // GTK must not see our own flags.
     app.run_with_args(&[std::env::args().next().unwrap_or_default()])
@@ -250,7 +267,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     };
 
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(&format!("{CSS}{}", attention::css()));
+    provider.load_from_string(&full_css());
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
@@ -263,6 +280,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         .default_height(760)
         .build();
 
+    window.add_css_class("cmux");
     let header = gtk::HeaderBar::new();
     let new_ws = gtk::Button::from_icon_name("list-add-symbolic");
     new_ws.set_tooltip_text(Some("New workspace"));
@@ -340,6 +358,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     switcher.set_margin_top(4);
     switcher.set_tooltip_text(Some("Workspaces / Files (Ctrl+Shift+F)"));
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    sidebar.add_css_class("cmux-sidebar");
     sidebar.set_width_request(200);
     sidebar.append(&switcher);
     sidebar.append(&sidebar_stack);
@@ -359,6 +378,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     status.set_margin_top(2);
     status.set_margin_bottom(2);
     status.add_css_class("dim-label");
+    status.add_css_class("cmux-status");
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let screens = gtk::Box::new(gtk::Orientation::Horizontal, 2);
@@ -408,6 +428,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         ui: None,
         viewport: None,
         css: Some(provider.clone()),
+        _theme_watch: watch_theme(&provider),
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -749,6 +770,32 @@ fn build_ui(app: &gtk::Application, session: &str) {
     }
 }
 
+/// The whole style sheet: layout, badges and the theme's chrome colours.
+fn full_css() -> String {
+    format!("{CSS}{}{}", attention::css(), theme::chrome_css())
+}
+
+/// Restyle when the cmux config changes (a theme switched with
+/// `cmux-theme`, in the TUI, or from this window). Waits for writes to
+/// settle: `cmux-theme` rewrites the config and the Ghostty block.
+fn watch_theme(provider: &gtk::CssProvider) -> Option<gio::FileMonitor> {
+    let file = gio::File::for_path(theme::config_path()?);
+    let monitor = file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE).ok()?;
+    let pending: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    let provider = provider.clone();
+    monitor.connect_changed(move |_, _, _, _| {
+        if let Some(source) = pending.take() {
+            source.remove();
+        }
+        let (provider, pending_inner) = (provider.clone(), pending.clone());
+        pending.set(Some(glib::timeout_add_local_once(Duration::from_millis(500), move || {
+            pending_inner.set(None);
+            provider.load_from_string(&full_css());
+        })));
+    });
+    Some(monitor)
+}
+
 /// Installed cmux themes (`~/.config/cmux/themes/*.json`), plus `default`.
 fn installed_themes() -> Vec<String> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
@@ -839,7 +886,7 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui) {
                         match process.wait_check_future().await {
                             Ok(()) => {
                                 if let Some(css) = state.borrow().css.as_ref() {
-                                    css.load_from_string(&format!("{CSS}{}", attention::css()));
+                                    css.load_from_string(&full_css());
                                 }
                                 ui.status.set_text(&format!("Theme: {name}"));
                             }
