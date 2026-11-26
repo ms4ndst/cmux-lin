@@ -23,6 +23,30 @@ else
   log "cmux-browser-provider not built (run scripts/30-build.sh); browser tabs will need another provider"
 fi
 
+# GTK app (if built): binary plus a launcher entry. The desktop file is
+# named after the app id, which desktop notifications refer to.
+GTK_APP="$REPO_ROOT/gui/cmux-gtk/target/release/cmux-gtk"
+if [ -x "$GTK_APP" ]; then
+  install -m 0755 "$GTK_APP" "$DEST/cmux-gtk"
+  APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$APPS_DIR"
+  cat > "$APPS_DIR/dev.cmuxlin.CmuxGtk.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=cmux
+GenericName=Terminal multiplexer
+Comment=Native window for the cmux session "main"
+Exec=$DEST/cmux-gtk --session main
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;multiplexer;agents;tmux;
+StartupWMClass=dev.cmuxlin.CmuxGtk
+DESKTOP
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$APPS_DIR" || true
+  log "installed cmux-gtk and its launcher entry ($APPS_DIR/dev.cmuxlin.CmuxGtk.desktop)"
+fi
+
 CONFIG_SRC="$REPO_ROOT/assets/cmux-tui.json"
 CONFIG_DEST="${XDG_CONFIG_HOME:-$HOME/.config}/cmux/cmux-tui.json"
 if [ -f "$CONFIG_SRC" ]; then
@@ -58,4 +82,5 @@ esac
 log "installed:"
 ls -l "$DEST/cmux-tui" "$DEST/cmux-tui-hook" "$DEST/cmux"
 [ -x "$DEST/cmux-browser-provider" ] && ls -l "$DEST/cmux-browser-provider"
+[ -x "$DEST/cmux-gtk" ] && ls -l "$DEST/cmux-gtk"
 log "cmux-tui $("$DEST/cmux-tui" --version | head -1)"

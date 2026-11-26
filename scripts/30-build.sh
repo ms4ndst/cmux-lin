@@ -42,6 +42,16 @@ env -u LD_LIBRARY_PATH \
   PATH="$HOME/.cargo/bin:$PATH" \
   cargo build --release --manifest-path "$REPO_ROOT/browser-provider/Cargo.toml"
 
+# GTK app (optional): needs the GTK4 and VTE development packages.
+if pkg-config --exists gtk4 vte-2.91-gtk4 2>/dev/null; then
+  log "building cmux-gtk (release)"
+  env -u LD_LIBRARY_PATH \
+    PATH="$HOME/.cargo/bin:$PATH" \
+    cargo build --release --manifest-path "$REPO_ROOT/gui/cmux-gtk/Cargo.toml"
+else
+  log "skipping cmux-gtk: install gtk4-devel and vte291-gtk4-devel to build the GTK app"
+fi
+
 log "binaries:"
 ls -lh "$SRC_DIR/cmux-tui/target/release/cmux-tui" "$SRC_DIR/cmux-tui/target/release/cmux-tui-hook" \
   "$REPO_ROOT/browser-provider/target/release/cmux-browser-provider"

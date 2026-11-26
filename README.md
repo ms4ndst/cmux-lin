@@ -37,7 +37,7 @@ cmux-lin/
 └── build/                    # (gitignored) source checkout + target/
 ```
 
-`gui/cmux-gtk` is an experimental native Linux window for a running session: a workspace sidebar plus a VTE terminal driven over cmux's protocol. It's a prototype, not a replacement for the TUI; see [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md).
+`gui/cmux-gtk` is a native Linux window (GTK4 + VTE) for a running session: workspaces, screens, splits, tabs, browser tabs, agent badges and notifications, driven over cmux's protocol. It complements the TUI rather than replacing it; see [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md).
 
 ## Build
 
@@ -51,6 +51,8 @@ Prerequisites (Fedora): `git`, `curl`, `gcc`, and LLVM/clang with `libclang` (`d
 ```
 
 `cmux` is on `PATH` afterwards (installs into `~/.local/bin`, which is on the default Fedora PATH).
+
+With `gtk4-devel` and `vte291-gtk4-devel` installed (`sudo dnf install gtk4-devel vte291-gtk4-devel`), `30-build.sh` also builds the GTK app and `40-install.sh` installs it as `cmux-gtk`, with a **cmux** entry in your application launcher that opens the `main` session. Without those packages the GTK app is skipped and everything else installs as usual.
 
 ## Run
 
