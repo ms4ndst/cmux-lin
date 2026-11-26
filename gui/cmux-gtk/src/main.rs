@@ -68,6 +68,8 @@ const CSS: &str = "
 /// the pane's active tab.
 struct PaneView {
     root: gtk::Box,
+    /// The terminal's right-click menu (detached when the view goes away).
+    term_menu: gtk::PopoverMenu,
     tabbar: gtk::Box,
     /// Shows `term` for a terminal tab, `web` for a browser tab.
     stack: gtk::Stack,
@@ -88,6 +90,12 @@ struct PaneView {
     reported: Option<(u16, u16)>,
     /// The pane state and tab attention the tab strip was last drawn from.
     drawn: Option<(Pane, Vec<Option<Attn>>)>,
+}
+
+impl Drop for PaneView {
+    fn drop(&mut self) {
+        self.term_menu.unparent();
+    }
 }
 
 impl PaneView {
@@ -142,6 +150,8 @@ struct State {
     raw: Vec<Workspace>,
     /// Widgets, for handlers that change the selection and redraw.
     ui: Option<Ui>,
+    /// The window's style sheet (badge colours follow the cmux theme).
+    css: Option<gtk::CssProvider>,
     /// The viewport-column row when the shown screen uses columns.
     viewport: Option<ViewportView>,
     /// Live pane views of the shown workspace, by pane id.
@@ -257,6 +267,12 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let new_ws = gtk::Button::from_icon_name("list-add-symbolic");
     new_ws.set_tooltip_text(Some("New workspace"));
     header.pack_start(&new_ws);
+    // Main menu: theme, workspace actions, sidebar view.
+    let main_menu = gtk::MenuButton::new();
+    main_menu.set_icon_name("open-menu-symbolic");
+    main_menu.set_tooltip_text(Some("Menu"));
+    main_menu.set_menu_model(Some(&build_main_menu()));
+    header.pack_end(&main_menu);
     window.set_titlebar(Some(&header));
 
     let list = gtk::ListBox::new();
@@ -391,6 +407,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         raw: Vec::new(),
         ui: None,
         viewport: None,
+        css: Some(provider.clone()),
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -656,6 +673,31 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     });
     app.add_action(&toggle_files);
+    install_app_actions(app, &state, &ui);
+
+    // Right-click a workspace in the sidebar: Rename / Close.
+    let row_menu = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
+    row_menu.set_parent(&ui.list);
+    row_menu.set_has_arrow(false);
+    let row_click = gtk::GestureClick::new();
+    row_click.set_button(3);
+    row_click.connect_pressed({
+        let (state, list) = (state.clone(), ui.list.clone());
+        move |_, _, x, y| {
+            let Some(row) = list.row_at_y(y as i32) else { return };
+            let Some(ws) = state.borrow().workspaces.get(row.index() as usize).map(|w| w.id) else { return };
+            let model = gio::Menu::new();
+            for (label, action) in [("Rename…", "app.rename-workspace"), ("Close workspace…", "app.close-workspace")] {
+                let item = gio::MenuItem::new(Some(label), None);
+                item.set_action_and_target_value(Some(action), Some(&ws.to_variant()));
+                model.append_item(&item);
+            }
+            row_menu.set_menu_model(Some(&model));
+            row_menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            row_menu.popup();
+        }
+    });
+    ui.list.add_controller(row_click);
 
     let open_menu = gio::SimpleAction::new("browser-menu", None);
     open_menu.connect_activate({
@@ -705,6 +747,183 @@ fn build_ui(app: &gtk::Application, session: &str) {
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// Installed cmux themes (`~/.config/cmux/themes/*.json`), plus `default`.
+fn installed_themes() -> Vec<String> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("cmux/themes"));
+    let mut names: Vec<String> = dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension().and_then(|x| x.to_str()) == Some("json"))
+                .then(|| path.file_stem()?.to_str().map(str::to_string))
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names.push("default".into());
+    names
+}
+
+/// The `cmux-theme` script (installed by scripts/40-install.sh), on PATH or
+/// in ~/.local/bin (a desktop launch may not have that on PATH).
+fn cmux_theme() -> PathBuf {
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).map(|d| d.join("cmux-theme")).find(|p| p.is_file())
+    });
+    on_path.unwrap_or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/cmux-theme")).unwrap_or_default()
+    })
+}
+
+fn current_theme() -> String {
+    std::process::Command::new(cmux_theme())
+        .arg("current")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into())
+}
+
+/// "sw-nord-dark" → "Sw nord dark"-style labels aren't nicer than the names
+/// people type with `cmux-theme set`, so the menu shows the names as is.
+fn build_main_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let themes = gio::Menu::new();
+    for name in installed_themes() {
+        let item = gio::MenuItem::new(Some(&name), None);
+        item.set_action_and_target_value(Some("app.theme"), Some(&name.to_variant()));
+        themes.append_item(&item);
+    }
+    let look = gio::Menu::new();
+    look.append_submenu(Some("Theme"), &themes);
+    look.append(Some("Workspaces / Files (Ctrl+Shift+F)"), Some("app.toggle-files"));
+    menu.append_section(None, &look);
+    let workspace = gio::Menu::new();
+    workspace.append(Some("New workspace"), Some("app.new-workspace"));
+    workspace.append(Some("Rename workspace…"), Some("app.rename-this-workspace"));
+    workspace.append(Some("Close workspace…"), Some("app.close-this-workspace"));
+    menu.append_section(None, &workspace);
+    menu
+}
+
+/// App actions behind the main menu and the sidebar's right-click menu.
+fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui) {
+    // Theme: a radio group whose state is the active cmux theme. Switching
+    // runs `cmux-theme set`, the same as the TUI's picker: it rewrites the
+    // config and the Ghostty colour block, reloads every session (terminals
+    // recolour through the server), and this window's badges follow.
+    let theme = gio::SimpleAction::new_stateful("theme", Some(glib::VariantTy::STRING), &current_theme().to_variant());
+    theme.connect_activate({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |action, target| {
+            let Some(name) = target.and_then(|t| t.get::<String>()) else { return };
+            action.set_state(&name.to_variant());
+            ui.status.set_text(&format!("Switching to theme {name}…"));
+            let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_PIPE);
+            let program = cmux_theme();
+            let spawned = launcher.spawn(&[program.as_os_str(), std::ffi::OsStr::new("set"), std::ffi::OsStr::new(&name)]);
+            let (state, ui) = (state.clone(), ui.clone());
+            match spawned {
+                Ok(process) => {
+                    glib::spawn_future_local(async move {
+                        match process.wait_check_future().await {
+                            Ok(()) => {
+                                if let Some(css) = state.borrow().css.as_ref() {
+                                    css.load_from_string(&format!("{CSS}{}", attention::css()));
+                                }
+                                ui.status.set_text(&format!("Theme: {name}"));
+                            }
+                            Err(error) => ui.status.set_text(&format!("cmux-theme failed: {error}")),
+                        }
+                    });
+                }
+                Err(error) => ui.status.set_text(&format!("Can't run cmux-theme ({}): {error}", program.display())),
+            }
+        }
+    });
+    app.add_action(&theme);
+
+    let new_workspace = gio::SimpleAction::new("new-workspace", None);
+    new_workspace.connect_activate({
+        let state = state.clone();
+        move |_, _| state.borrow().send(Ctl::NewWorkspace)
+    });
+    app.add_action(&new_workspace);
+
+    // Rename / close a workspace by id (sidebar menu) or the shown one
+    // (main menu).
+    let rename = |state: &Shared, ui: &Ui, ws_id: u64| {
+        let st = state.borrow();
+        let Some(index) = st.workspaces.iter().position(|w| w.id == ws_id) else { return };
+        let current = st.workspaces[index].name.clone();
+        let ctl = st.ctl.clone();
+        drop(st);
+        let Some(row) = ui.list.row_at_index(index as i32) else { return };
+        rename_popover(&ui.list, &row, &current, move |name| {
+            let _ = ctl.send(Ctl::request(json!({ "cmd": "rename-workspace", "workspace": ws_id, "name": name })));
+        });
+    };
+    for (name, by_id) in [("rename-workspace", true), ("rename-this-workspace", false), ("close-workspace", true), ("close-this-workspace", false)] {
+        let action = gio::SimpleAction::new(name, by_id.then_some(glib::VariantTy::UINT64));
+        let closing = name.starts_with("close");
+        action.connect_activate({
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_, target| {
+                let ws_id = if by_id { target.and_then(|t| t.get::<u64>()) } else { state.borrow().selected };
+                let Some(ws_id) = ws_id else { return };
+                if closing {
+                    confirm_close_workspace(&state, ws_id);
+                } else {
+                    rename(&state, &ui, ws_id);
+                }
+            }
+        });
+        app.add_action(&action);
+    }
+}
+
+/// Closing a workspace ends its shells: say which and how many, then close.
+fn confirm_close_workspace(state: &Shared, ws_id: u64) {
+    let st = state.borrow();
+    let Some(ws) = st.raw.iter().find(|w| w.id == ws_id) else { return };
+    let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+    let terminals: Vec<String> = ws.all_tabs().filter_map(|t| t.terminal_id.clone()).collect();
+    let browsers = ws.all_tabs().filter(|t| !t.terminal).count();
+    let Some(window) = st.window.upgrade() else { return };
+    let ctl = st.ctl.clone();
+    drop(st);
+    let mut detail = format!(
+        "This ends {} shell{} running in it",
+        terminals.len(),
+        if terminals.len() == 1 { "" } else { "s" }
+    );
+    if browsers > 0 {
+        detail.push_str(&format!(" and closes {browsers} browser tab{}", if browsers == 1 { "" } else { "s" }));
+    }
+    detail.push_str(". Anything running there stops.");
+    let dialog = gtk::AlertDialog::builder()
+        .message(format!("Close workspace “{name}”?"))
+        .detail(detail)
+        .buttons(["Cancel", "Close workspace"])
+        .cancel_button(0)
+        .default_button(0)
+        .modal(true)
+        .build();
+    glib::spawn_future_local(async move {
+        if let Ok(1) = dialog.choose_future(Some(&window)).await {
+            let _ = ctl.send(Ctl::CloseWorkspace { workspace: ws_id, terminals });
+        }
+    });
 }
 
 /// Ctrl+Shift+T new tab, Ctrl+Shift+W close tab, Ctrl+Shift+E split right,
@@ -1593,6 +1812,87 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         }
     });
 
+    // Clipboard: Ctrl+Shift+C copies the selection, Ctrl+Shift+V and
+    // Shift+Insert paste (plain Ctrl+C/V belong to the program running).
+    // VTE pastes through the same `commit` path as typing, so the text
+    // reaches the session with bracketed paste respected; middle-click
+    // pastes the primary selection the same way.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let term = term.clone();
+        move |_, key, _, state| {
+            let ctrl_shift = state.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+            let lower = key.to_lower();
+            if ctrl_shift && lower == gdk::Key::c {
+                if term.has_selection() {
+                    term.copy_clipboard_format(vte4::Format::Text);
+                }
+                glib::Propagation::Stop
+            } else if (ctrl_shift && lower == gdk::Key::v)
+                || (state.contains(gdk::ModifierType::SHIFT_MASK) && key == gdk::Key::Insert)
+            {
+                term.paste_clipboard();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    term.add_controller(keys);
+
+    let term_actions = gio::SimpleActionGroup::new();
+    for name in ["copy", "paste", "select-all"] {
+        let action = gio::SimpleAction::new(name, None);
+        let term = term.clone();
+        action.connect_activate(move |_, _| match name {
+            "copy" => {
+                if term.has_selection() {
+                    term.copy_clipboard_format(vte4::Format::Text);
+                }
+            }
+            "paste" => term.paste_clipboard(),
+            _ => term.select_all(),
+        });
+        term_actions.add_action(&action);
+    }
+    term.insert_action_group("term", Some(&term_actions));
+
+    // Right-click: clipboard and pane actions. Shift+right-click goes to the
+    // program instead (for terminal apps that use the mouse).
+    let term_menu = gtk::PopoverMenu::from_model(Some(&{
+        let menu = gio::Menu::new();
+        let edit = gio::Menu::new();
+        edit.append(Some("Copy (Ctrl+Shift+C)"), Some("term.copy"));
+        edit.append(Some("Paste (Ctrl+Shift+V)"), Some("term.paste"));
+        edit.append(Some("Select all"), Some("term.select-all"));
+        menu.append_section(None, &edit);
+        let pane = gio::Menu::new();
+        pane.append(Some("New tab"), Some("pane.new-tab"));
+        pane.append(Some("Split right"), Some("pane.split-right"));
+        pane.append(Some("Split down"), Some("pane.split-down"));
+        pane.append(Some("Zoom / unzoom"), Some("pane.zoom"));
+        menu.append_section(None, &pane);
+        menu
+    }));
+    term_menu.set_parent(&term);
+    term_menu.set_has_arrow(false);
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    right_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    right_click.connect_pressed({
+        let term_menu = term_menu.clone();
+        move |gesture, _, x, y| {
+            if gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK) {
+                return; // to the program
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            term_menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            term_menu.popup();
+        }
+    });
+    term.add_controller(right_click);
+
     // Focusing a terminal makes its pane the shortcut target (client-local).
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
@@ -1677,6 +1977,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
 
     PaneView {
         root,
+        term_menu,
         tabbar,
         stack,
         term,
@@ -1917,6 +2218,16 @@ fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: 
         move |_, _| send(json!({ "cmd": "zoom-pane", "pane": id, "mode": "toggle" }))
     });
     group.add_action(&zoom);
+    for (name, request) in [
+        ("new-tab", json!({ "cmd": "new-tab", "pane": id })),
+        ("split-right", json!({ "cmd": "split", "pane": id, "dir": "right" })),
+        ("split-down", json!({ "cmd": "split", "pane": id, "dir": "down" })),
+    ] {
+        let action = gio::SimpleAction::new(name, None);
+        let send = send.clone();
+        action.connect_activate(move |_, _| send(request.clone()));
+        group.add_action(&action);
+    }
     let new_column = gio::SimpleAction::new("new-column", None);
     new_column.connect_activate({
         let send = send.clone();

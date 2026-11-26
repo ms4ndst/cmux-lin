@@ -132,6 +132,8 @@ pub struct Tab {
     pub surface: u64,
     /// Stable canonical tab id (`tab_…`).
     pub tab_id: Option<String>,
+    /// The session terminal behind a terminal tab (for `close-terminal`).
+    pub terminal_id: Option<String>,
     /// Name the user gave the tab (shown instead of the title when set).
     pub name: Option<String>,
     pub title: String,
@@ -214,6 +216,10 @@ pub enum Ctl {
     NewWorkspace,
     /// Re-poll now (sent by the event thread when something changed).
     Poke,
+    /// End the given terminals (`terminal_id`s), then remove the workspace.
+    /// `close-workspace` alone only removes placements: its shells would
+    /// keep running unseen in the session.
+    CloseWorkspace { workspace: u64, terminals: Vec<String> },
     /// Report the working directory of terminal `surface` ([`UiMsg::Cwd`]).
     ProcessInfo { surface: u64 },
     /// Undo the latest layout change on `pane`'s screen; `confirm` is the
@@ -308,6 +314,18 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             let result = match ctl {
                 Ctl::Poke => Ok(()),
                 Ctl::Undo { pane, confirm } => undo_layout(client, ui, pane, confirm),
+                Ctl::CloseWorkspace { workspace, terminals } => {
+                    for terminal in terminals {
+                        let mut request = serde_json::Map::new();
+                        request.insert("cmd".into(), json!("close-terminal"));
+                        request.insert("terminal_id".into(), json!(terminal));
+                        let _ = client.request_raw(request); // already gone is fine
+                    }
+                    let mut request = serde_json::Map::new();
+                    request.insert("cmd".into(), json!("close-workspace"));
+                    request.insert("workspace".into(), json!(workspace));
+                    client.request_raw(request).map(|_| ())
+                }
                 Ctl::ProcessInfo { surface } => {
                     let mut request = serde_json::Map::new();
                     request.insert("cmd".into(), json!("process-info"));
@@ -714,6 +732,7 @@ fn parse_pane(pane: &Value) -> Option<Pane> {
                     Some(Tab {
                         surface: tab.get("surface")?.as_u64()?,
                         tab_id: tab.get("tab_resource_id").and_then(Value::as_str).map(str::to_string),
+                        terminal_id: tab.get("terminal_id").and_then(Value::as_str).map(str::to_string),
                         name: tab.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).map(str::to_string),
                         title: tab.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
                         terminal: tab.get("kind").and_then(Value::as_str) == Some("pty"),

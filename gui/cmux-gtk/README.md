@@ -20,7 +20,10 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
 - terminal colours follow the active cmux theme;
 - agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
-- the header's `+` creates a workspace;
+- the header's `+` creates a workspace, and the **☰ menu** has **Theme** (every installed cmux theme, the current one marked), the Workspaces/Files switch, and New / Rename / Close workspace. Right-click a workspace in the sidebar for Rename and Close;
+- **closing a workspace** asks first, then ends its shells and closes its browser tabs before removing it. The server's own `close-workspace` only removes the layout and would leave the shells running unseen. (Closing a single tab with `×` keeps upstream's behaviour: the tab goes, and its shell stays in the session, as in the TUI.);
+- picking a **theme** runs `cmux-theme set`, the same as the TUI's picker, so it switches everywhere at once: the config, the Ghostty colour block, every session's terminals, and this window's badges (plus the desktop theme, if you paired one);
+- in a terminal pane, `Ctrl+Shift+C` copies the selection and `Ctrl+Shift+V` or `Shift+Insert` pastes (plain Ctrl+C/V belong to the program running), and right-click opens a menu with Copy, Paste, Select all, New tab, Split right/down and Zoom. Shift+right-click goes to the program instead, for terminal apps that use the mouse;
 - if the session stops or restarts, the window dims and waits, then reconnects by itself and re-attaches every pane (it can also be started before the session exists).
 
 All layout changes (splits, tabs, moves, zoom, names) are requests to the server, and the window redraws from the tree the server reports back, so the layout can't drift from the TUI's. Only the selection is the window's own.
@@ -92,6 +95,7 @@ They act on the pane you're typing in:
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
 | `Ctrl+Shift+F` | Sidebar: Workspaces / Files |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in a terminal pane (also `Shift+Insert`) |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
 
