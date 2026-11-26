@@ -91,6 +91,8 @@ impl Pane {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
     pub surface: u64,
+    /// Stable canonical tab id (`tab_…`).
+    pub tab_id: Option<String>,
     pub title: String,
     pub terminal: bool,
     /// Level of an unread notification on this tab (`info`, `warning`,
@@ -113,6 +115,9 @@ pub enum UiMsg {
     /// recovered (`None`).
     BrowserProblem(Option<String>),
     Tree(Vec<Workspace>, Agents),
+    /// The selection read from a browser tab for copy (or cut), for the
+    /// attachment with this `generation`.
+    Copied { generation: u64, result: Result<String, String>, cut: bool },
     /// A posted notification (from `notify`, an agent hook, or the mux).
     Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
     /// Output for the attachment with this `generation` (unique across all
@@ -211,11 +216,7 @@ enum Served {
 fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiMsg>) -> Served {
     let mut last: Option<(Vec<Workspace>, Agents)> = None;
     loop {
-        let snapshot = client.workspace_tree().and_then(|tree| {
-            let workspaces =
-                serde_json::to_value(&tree).map(|value| parse_workspaces(&value)).unwrap_or_default();
-            Ok((workspaces, list_agents(client)?))
-        });
+        let snapshot = list_workspaces(client).and_then(|workspaces| Ok((workspaces, list_agents(client)?)));
         match snapshot {
             Ok(snapshot) => {
                 if last.is_none() && ui.send_blocking(UiMsg::Connected).is_err() {
@@ -255,6 +256,20 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             }
         }
     }
+}
+
+/// The workspace tree, read raw: the SDK's typed tree drops fields it
+/// doesn't model (such as a tab's `tab_resource_id`).
+fn list_workspaces(client: &mut Client) -> Result<Vec<Workspace>, Error> {
+    let mut request = serde_json::Map::new();
+    request.insert("cmd".into(), json!("list-workspaces"));
+    let response = client.request_raw(request)?;
+    let tree = if response.get("workspaces").is_some() {
+        response
+    } else {
+        response.get("data").cloned().unwrap_or(Value::Null)
+    };
+    Ok(parse_workspaces(&tree))
 }
 
 /// The agent roster as surface → status. `status` is the vocabulary every
@@ -547,6 +562,7 @@ fn parse_pane(pane: &Value) -> Option<Pane> {
                     let marker = tab.get("notification").filter(|m| m.is_object());
                     Some(Tab {
                         surface: tab.get("surface")?.as_u64()?,
+                        tab_id: tab.get("tab_resource_id").and_then(Value::as_str).map(str::to_string),
                         title: tab.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
                         terminal: tab.get("kind").and_then(Value::as_str) == Some("pty"),
                         unread: marker

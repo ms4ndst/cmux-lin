@@ -471,3 +471,82 @@ fn http(port: u16, method: &str, path: &str) -> Result<String, String> {
     reader.read_exact(&mut body).map_err(|e| e.to_string())?;
     String::from_utf8(body).map_err(|e| e.to_string())
 }
+
+/// The text selected in browser tab `tab_id` of the session at
+/// `socket_path`: the selected part of a focused text field, else the page
+/// selection. Empty when nothing is selected.
+///
+/// The session protocol has no selection command for browser tabs (`copy`
+/// is terminal-only), so this asks the page itself over the DevTools
+/// Protocol, using the endpoint and target the provider registered.
+pub fn selected_text(socket_path: &Path, tab_id: &str) -> Result<String, String> {
+    const EXPRESSION: &str = r#"(() => {
+        const el = document.activeElement;
+        const text = el && (el.tagName === "TEXTAREA" ||
+            (el.tagName === "INPUT" && /^(text|search|url|tel|email|number)$/i.test(el.type)));
+        if (text && el.selectionStart !== el.selectionEnd)
+            return el.value.substring(el.selectionStart, el.selectionEnd);
+        return String(window.getSelection() || "");
+    })()"#;
+    let value = evaluate(socket_path, tab_id, EXPRESSION)?;
+    Ok(value.as_str().unwrap_or("").to_string())
+}
+
+/// Evaluate `expression` in the page of browser tab `tab_id` and return its
+/// value (by value, JSON).
+fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Value, String> {
+    let mut session = Session::connect(socket_path).map_err(|e| e.to_string())?;
+    let provider = session.request(json!({ "cmd": "get-browser-provider" }))?;
+    if provider.get("available") != Some(&Value::Bool(true)) {
+        return Err("no browser provider is running".into());
+    }
+    if provider.get("authentication").and_then(Value::as_str) == Some("bearer") {
+        return Err("the browser provider requires authentication".into());
+    }
+    let target = provider
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|t| t.get("tab_id").and_then(Value::as_str) == Some(tab_id))
+        .and_then(|t| t.get("target_id").and_then(Value::as_str))
+        .ok_or("this tab has no page yet")?
+        .to_string();
+    // ws://127.0.0.1:PORT/devtools/browser/ID → the page's own endpoint.
+    let endpoint = provider.get("endpoint").and_then(Value::as_str).ok_or("provider has no endpoint")?;
+    let authority = endpoint
+        .strip_prefix("ws://")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("unexpected provider endpoint")?;
+    let host_port: Vec<&str> = authority.rsplitn(2, ':').collect();
+    let (port, host) = match host_port.as_slice() {
+        [port, host] => (port.parse::<u16>().map_err(|_| "bad endpoint port")?, *host),
+        _ => return Err("unexpected provider endpoint".into()),
+    };
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return Err("refusing a non-loopback DevTools endpoint".into());
+    }
+    let url = format!("ws://{authority}/devtools/page/{target}");
+    let stream = TcpStream::connect((host.trim_matches(|c| c == '[' || c == ']'), port)).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let (mut socket, _) = tungstenite::client(url.as_str(), stream).map_err(|e| e.to_string())?;
+    let request = json!({
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": { "expression": expression, "returnByValue": true },
+    });
+    socket.send(tungstenite::Message::text(request.to_string())).map_err(|e| e.to_string())?;
+    loop {
+        let message = socket.read().map_err(|e| e.to_string())?;
+        let Ok(text) = message.to_text() else { continue };
+        let Ok(reply) = serde_json::from_str::<Value>(text) else { continue };
+        if reply.get("id").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        let _ = socket.close(None);
+        if let Some(error) = reply.get("error") {
+            return Err(error.get("message").and_then(Value::as_str).unwrap_or("evaluation failed").to_string());
+        }
+        return Ok(reply.pointer("/result/result/value").cloned().unwrap_or(Value::Null));
+    }
+}

@@ -31,6 +31,16 @@ If no browser can be started, the provider says so once, in the browser tab and 
 
 In the window, a browser tab has an address bar (bare domains get `https://`) plus back, forward and reload. Clicks, drags, scrolling and typing are forwarded to the page. Each click quotes the frame it was aimed at, the protocol's guard against clicking a page that changed underneath you.
 
+Select text as in any browser: drag, double-click a word, triple-click a line, Shift+arrows, or Ctrl+A. Then use the desktop clipboard:
+
+| Keys | Action |
+|---|---|
+| `Ctrl+C` or `Ctrl+Shift+C` | Copy the selection |
+| `Ctrl+X` | Cut (copy, then delete the selection in a text field) |
+| `Ctrl+V`, `Ctrl+Shift+V` or `Shift+Insert` | Paste |
+
+The page runs in a headless browser whose own clipboard isn't the desktop's, so the window handles the clipboard itself. Copy asks the page for its selection over the DevTools Protocol (the selected part of a focused text field, otherwise the page selection), using the endpoint the provider registered, since the session protocol's `copy` only covers terminals. Paste types the clipboard text into the page. Both are also exposed as the actions `app.browser-copy` and `app.browser-paste`.
+
 ## Agent attention and notifications
 
 Each tab gets a mark, ranked most urgent first the same way every cmux client ranks them:
@@ -93,7 +103,7 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 
 - multiple screens per workspace (only the active screen is shown);
 - switching workspaces on the server when you click one (the click is local);
-- browser text selection, copy/paste, right-click menus and file uploads (pointer, scroll and typing work);
+- right-click menus and file uploads in browser tabs (selection, copy/paste, pointer, scroll and typing work);
 - zoom, pane swap, and other layout commands beyond split/close;
 
 ## Debugging

@@ -2,6 +2,11 @@
 //! frames the session streams (the page itself runs in the session's browser
 //! provider, so agents and the TUI see the same page).
 //!
+//! Copy and cut read the page's selection (the host does that over DevTools,
+//! via `clip`) and put it on the desktop clipboard; paste types the desktop
+//! clipboard into the page. Selecting itself happens in the page: drag,
+//! double/triple click, Shift+arrows, Ctrl+A.
+//!
 //! Input is forwarded as protocol browser commands through `send`. Pointer
 //! input must quote the guard token of the frame it was aimed at
 //! (`pointer_frame_seq`), so clicks can't land on a page that changed
@@ -20,6 +25,10 @@ use crate::backend::Frame;
 /// Sends one browser command (`cmd`, fields) for this pane's tab.
 pub type Send = Rc<dyn Fn(&str, Value)>;
 
+/// Asks the host to copy the tab's selection to the clipboard; `true` cuts
+/// (deletes the selection afterwards).
+pub type Clip = Rc<dyn Fn(bool)>;
+
 pub struct WebView {
     pub root: gtk::Box,
     entry: gtk::Entry,
@@ -31,10 +40,14 @@ pub struct WebView {
     /// Size of the shown frame in page pixels.
     frame: Rc<Cell<(f64, f64)>>,
     pointer_seq: Rc<Cell<Option<u64>>>,
+    /// Mouse button held down, so drags select (moves carry the button).
+    held: Rc<Cell<Option<&'static str>>>,
+    clip: Clip,
+    send: Send,
 }
 
 impl WebView {
-    pub fn new(send: Send) -> Self {
+    pub fn new(send: Send, clip: Clip) -> Self {
         let back = gtk::Button::from_icon_name("go-previous-symbolic");
         back.set_tooltip_text(Some("Back"));
         let forward = gtk::Button::from_icon_name("go-next-symbolic");
@@ -99,6 +112,9 @@ impl WebView {
             message,
             frame: Rc::new(Cell::new((0.0, 0.0))),
             pointer_seq: Rc::new(Cell::new(None)),
+            held: Rc::new(Cell::new(None)),
+            clip: clip.clone(),
+            send: send.clone(),
         };
 
         for (button, cmd) in [(&back, "browser-back"), (&forward, "browser-forward"), (&reload, "browser-reload")] {
@@ -117,7 +133,7 @@ impl WebView {
             }
         });
         view.wire_pointer(&send);
-        view.wire_keys(&send);
+        view.wire_keys(&send, clip);
         view
     }
 
@@ -187,6 +203,13 @@ impl WebView {
         ((w / cell_w).clamp(1, 10_000) as u16, (h / cell_h).clamp(1, 10_000) as u16)
     }
 
+    /// Copy and paste entry points for menus and actions:
+    /// (copy/cut, paste).
+    pub fn clip_handle(&self) -> (Clip, Rc<dyn Fn()>) {
+        let (picture, send) = (self.picture.clone(), self.send.clone());
+        (self.clip.clone(), Rc::new(move || paste(&picture, &send)))
+    }
+
     /// The widget that takes keyboard focus for this view.
     pub fn focus_widget(&self) -> gtk::Widget {
         self.picture.clone().upcast()
@@ -213,17 +236,20 @@ impl WebView {
 
         let click = gtk::GestureClick::new();
         click.set_button(0);
-        let button_name = |button: u32| match button {
-            2 => "middle",
-            3 => "right",
-            _ => "left",
-        };
+        fn button_name(button: u32) -> &'static str {
+            match button {
+                2 => "middle",
+                3 => "right",
+                _ => "left",
+            }
+        }
         click.connect_pressed({
-            let (send, to_page, seq, picture) =
-                (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.picture.clone());
+            let (send, to_page, seq, picture, held) =
+                (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.picture.clone(), self.held.clone());
             move |gesture, presses, x, y| {
                 picture.grab_focus();
                 let (Some((px, py)), Some(frame_seq)) = (to_page(x, y), seq.get()) else { return };
+                held.set(Some(button_name(gesture.current_button())));
                 send("browser-mouse-guarded", json!({
                     "kind": "down", "button": button_name(gesture.current_button()),
                     "click_count": presses, "frame_seq": frame_seq, "x_px": px, "y_px": py,
@@ -231,8 +257,10 @@ impl WebView {
             }
         });
         click.connect_released({
-            let (send, to_page, seq) = (send.clone(), to_page.clone(), self.pointer_seq.clone());
+            let (send, to_page, seq, held) =
+                (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.held.clone());
             move |gesture, presses, x, y| {
+                held.set(None);
                 let (Some((px, py)), Some(frame_seq)) = (to_page(x, y), seq.get()) else { return };
                 send("browser-mouse-guarded", json!({
                     "kind": "up", "button": button_name(gesture.current_button()),
@@ -246,16 +274,20 @@ impl WebView {
         let motion = gtk::EventControllerMotion::new();
         let last = Rc::new(Cell::new(Instant::now()));
         motion.connect_motion({
-            let (send, to_page, seq) = (send.clone(), to_page.clone(), self.pointer_seq.clone());
+            let (send, to_page, seq, held) =
+                (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.held.clone());
             move |_, x, y| {
                 if last.get().elapsed() < Duration::from_millis(30) {
                     return;
                 }
                 let (Some((px, py)), Some(frame_seq)) = (to_page(x, y), seq.get()) else { return };
                 last.set(Instant::now());
-                send("browser-mouse-guarded", json!({
-                    "kind": "move", "frame_seq": frame_seq, "x_px": px, "y_px": py,
-                }));
+                let mut fields = json!({ "kind": "move", "frame_seq": frame_seq, "x_px": px, "y_px": py });
+                // While a button is held the move is a drag (text selection).
+                if let Some(button) = held.get() {
+                    fields["button"] = json!(button);
+                }
+                send("browser-mouse-guarded", fields);
             }
         });
         self.picture.add_controller(motion);
@@ -286,10 +318,29 @@ impl WebView {
 
     /// Keyboard: text goes in as inserted text, editing and navigation keys
     /// (and Ctrl/Alt chords) as key presses.
-    fn wire_keys(&self, send: &Send) {
+    fn wire_keys(&self, send: &Send, clip: Clip) {
         let keys = gtk::EventControllerKey::new();
         let send = send.clone();
+        let picture = self.picture.clone();
         keys.connect_key_pressed(move |_, key, _, state| {
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let lower = key.to_lower();
+            // Clipboard: Ctrl+C / Ctrl+Shift+C copy, Ctrl+X cut, Ctrl+V /
+            // Ctrl+Shift+V / Shift+Insert paste. The page's own clipboard is
+            // the headless browser's, so these go through the desktop's.
+            if ctrl && lower == gdk::Key::c {
+                clip(false);
+                return glib::Propagation::Stop;
+            }
+            if ctrl && !shift && lower == gdk::Key::x {
+                clip(true);
+                return glib::Propagation::Stop;
+            }
+            if (ctrl && lower == gdk::Key::v) || (shift && key == gdk::Key::Insert) {
+                paste(&picture, &send);
+                return glib::Propagation::Stop;
+            }
             let mut modifiers = 0u32;
             if state.contains(gdk::ModifierType::ALT_MASK) {
                 modifiers |= 1;
@@ -331,6 +382,19 @@ impl WebView {
         });
         self.picture.add_controller(keys);
     }
+}
+
+/// Type the desktop clipboard's text into the page.
+fn paste(widget: &gtk::Picture, send: &Send) {
+    let clipboard = widget.clipboard();
+    let send = send.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(Some(text)) = clipboard.read_text_future().await {
+            if !text.is_empty() {
+                send("browser-insert-text", json!({ "text": text.as_str() }));
+            }
+        }
+    });
 }
 
 /// Keys sent as key presses: (DOM key/code name, Windows virtual key code,

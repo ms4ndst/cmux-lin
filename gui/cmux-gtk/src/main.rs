@@ -70,6 +70,8 @@ struct PaneView {
     browser: bool,
     /// Whether that browser tab has been seen live on this attachment.
     browser_live: bool,
+    /// The browser tab's stable id, for reading its selection.
+    browser_tab: Option<String>,
     attachment: Option<Attachment>,
     surface: Option<u64>,
     /// Unique per attachment; routes attach events to this pane.
@@ -348,6 +350,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
             while let Ok(msg) = ui_rx.recv().await {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
+                    UiMsg::Copied { generation, result, cut } => on_copied(&state, &ui, generation, result, cut),
                     UiMsg::BrowserProblem(problem) => {
                         if let Some(problem) = &problem {
                             ui.status.set_text(problem);
@@ -406,6 +409,28 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     });
     app.add_action(&show_surface);
+
+    // Copy / paste in the focused browser tab, also reachable as actions
+    // (menus, D-Bus): `app.browser-copy`, `app.browser-paste`.
+    for (name, paste) in [("browser-copy", false), ("browser-paste", true)] {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate({
+            let state = state.clone();
+            move |_, _| {
+                let view = {
+                    let st = state.borrow();
+                    st.target_pane().and_then(|id| st.panes.get(&id)).filter(|v| v.browser).map(|v| v.web.clip_handle())
+                };
+                if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+                    eprintln!("cmux-gtk: action {} on browser view: {}", if paste { "paste" } else { "copy" }, view.is_some());
+                }
+                if let Some((clip, paste_fn)) = view {
+                    if paste { paste_fn() } else { clip(false) }
+                }
+            }
+        });
+        app.add_action(&action);
+    }
 
     window.present();
 
@@ -805,7 +830,25 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
             }
         }
     });
-    let web = browser::WebView::new(send);
+    // Copy/cut: read the page's selection off the UI thread (it's a
+    // DevTools round trip), then put it on the clipboard in `on_copied`.
+    let clip: browser::Clip = Rc::new({
+        let state = state.clone();
+        move |cut| {
+            let st = state.borrow();
+            let Some(view) = st.panes.get(&id) else { return };
+            if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+                eprintln!("cmux-gtk: copy pane {id} tab {:?}", view.browser_tab);
+            }
+            let Some(tab_id) = view.browser_tab.clone() else { return };
+            let (socket, ui_tx, generation) = (st.socket_path.clone(), st.ui_tx.clone(), view.generation);
+            std::thread::spawn(move || {
+                let result = provider::selected_text(&socket, &tab_id);
+                let _ = ui_tx.send_blocking(UiMsg::Copied { generation, result, cut });
+            });
+        }
+    });
+    let web = browser::WebView::new(send, clip);
     let web_focus = gtk::EventControllerFocus::new();
     web_focus.connect_enter({
         let state = state.clone();
@@ -837,6 +880,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         web,
         browser: false,
         browser_live: false,
+        browser_tab: None,
         attachment: None,
         surface: None,
         generation: 0,
@@ -880,6 +924,7 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
         return;
     };
     view.browser = !tab.terminal;
+    view.browser_tab = if view.browser { tab.tab_id.clone() } else { None };
     let (size, cells) = if view.browser {
         view.stack.set_visible_child_name("web");
         view.web.clear();
@@ -1094,6 +1139,34 @@ fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
     render(state, ui);
     if let Some(window) = state.borrow().window.upgrade() {
         window.present();
+    }
+}
+
+/// A browser tab's selection arrived: put it on the desktop clipboard, and
+/// for cut, delete it in the page now that it's safely copied.
+fn on_copied(state: &Shared, ui: &Ui, generation: u64, result: Result<String, String>, cut: bool) {
+    if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+        eprintln!("cmux-gtk: copy result {:?}", result.as_ref().map(|t| t.chars().count()));
+    }
+    match result {
+        Ok(text) if text.is_empty() => ui.status.set_text("Nothing selected"),
+        Ok(text) => {
+            if let Some(display) = gdk::Display::default() {
+                display.clipboard().set_text(&text);
+            }
+            let chars = text.chars().count();
+            ui.status.set_text(&format!("{} {chars} character{}", if cut { "Cut" } else { "Copied" }, if chars == 1 { "" } else { "s" }));
+            if cut {
+                let st = state.borrow();
+                let attachment = st.panes.values().find(|v| v.generation == generation).and_then(|v| v.attachment.as_ref());
+                if let Some(attachment) = attachment {
+                    attachment.browser("browser-key-press", json!({
+                        "key": "Delete", "code": "Delete", "modifiers": 0, "windows_virtual_key_code": 46,
+                    }));
+                }
+            }
+        }
+        Err(error) => ui.status.set_text(&format!("Copy failed: {error}")),
     }
 }
 
