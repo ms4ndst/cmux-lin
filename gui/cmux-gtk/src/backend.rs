@@ -94,6 +94,10 @@ pub struct Tab {
 
 /// Messages from workers to the UI.
 pub enum UiMsg {
+    /// The session answered again (first contact, or after a restart).
+    Connected,
+    /// The session stopped answering; the control thread keeps retrying.
+    Disconnected(String),
     Tree(Vec<Workspace>),
     /// Output for the attachment with this `generation` (unique across all
     /// panes); events from replaced attachments are dropped by the UI.
@@ -127,58 +131,108 @@ pub fn config_for(session: &str) -> Result<ClientConfig, Error> {
     Ok(ClientConfig::try_from_env_or_default_session(session)?.with_timeout(Duration::from_secs(10)))
 }
 
-/// Control thread: tree polling plus workspace creation.
+/// Control thread: tree polling and layout requests, reconnecting forever.
+///
+/// The session is "up" once a workspace tree has been read; until then, and
+/// whenever a poll fails (the server stopped or restarted), the UI gets
+/// [`UiMsg::Disconnected`] once and the thread retries every second.
+/// Requests sent while disconnected are dropped (the UI greys itself out).
 pub fn spawn_control(config: ClientConfig, rx: Receiver<Ctl>, ui: async_channel::Sender<UiMsg>) {
     std::thread::spawn(move || {
-        let mut client = match Client::connect(config) {
-            Ok(client) => client,
-            Err(error) => {
-                let _ = ui.send_blocking(UiMsg::Status(format!("cannot connect: {error}")));
-                return;
-            }
-        };
-        let mut last: Option<Vec<Workspace>> = None;
+        let mut announced_down = false;
         loop {
-            match client.workspace_tree() {
-                Ok(tree) => {
-                    let workspaces = serde_json::to_value(&tree)
-                        .map(|value| parse_workspaces(&value))
-                        .unwrap_or_default();
-                    if last.as_ref() != Some(&workspaces) {
-                        last = Some(workspaces.clone());
-                        if ui.send_blocking(UiMsg::Tree(workspaces)).is_err() {
-                            return; // UI gone
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = ui.send_blocking(UiMsg::Status(format!("session lost: {error}")));
+            let (lost, was_up) = match Client::connect(config.clone()) {
+                Ok(mut client) => match serve(&mut client, &rx, &ui) {
+                    Served::UiGone => return,
+                    Served::Lost { reason, was_up } => (reason, was_up),
+                },
+                Err(error) => (error.to_string(), false),
+            };
+            // A new outage after a successful connection is announced again.
+            if was_up {
+                announced_down = false;
+            }
+            if !announced_down {
+                announced_down = true;
+                if ui.send_blocking(UiMsg::Disconnected(lost)).is_err() {
                     return;
                 }
             }
-            // Wait for a request or the next poll. After a request, loop
-            // straight back to re-read the tree so the UI updates at once.
-            match rx.recv_timeout(TREE_POLL) {
-                Ok(ctl) => {
-                    let result = match ctl {
-                        Ctl::NewWorkspace => client
-                            .new_workspace(NewWorkspaceRequest {
-                                name: Optional::Value("gtk".to_string()),
-                                ..Default::default()
-                            })
-                            .map(|_| ()),
-                        Ctl::Request(Value::Object(request)) => client.request_raw(request).map(|_| ()),
-                        Ctl::Request(_) => Ok(()),
-                    };
-                    if let Err(error) = result {
-                        let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            if !wait_and_drop(&rx, RETRY) {
+                return;
             }
         }
     });
+}
+
+/// How long to wait between reconnect attempts.
+const RETRY: Duration = Duration::from_secs(1);
+
+enum Served {
+    UiGone,
+    /// The connection failed; `was_up` if a tree had been read on it.
+    Lost { reason: String, was_up: bool },
+}
+
+/// Poll and run requests on one connection until it fails.
+fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiMsg>) -> Served {
+    let mut last: Option<Vec<Workspace>> = None;
+    loop {
+        match client.workspace_tree() {
+            Ok(tree) => {
+                let workspaces =
+                    serde_json::to_value(&tree).map(|value| parse_workspaces(&value)).unwrap_or_default();
+                if last.is_none() && ui.send_blocking(UiMsg::Connected).is_err() {
+                    return Served::UiGone;
+                }
+                if last.as_ref() != Some(&workspaces) {
+                    last = Some(workspaces.clone());
+                    if ui.send_blocking(UiMsg::Tree(workspaces)).is_err() {
+                        return Served::UiGone;
+                    }
+                }
+            }
+            Err(error) => return Served::Lost { reason: error.to_string(), was_up: last.is_some() },
+        }
+        // Wait for a request or the next poll. After a request, loop
+        // straight back to re-read the tree so the UI updates at once.
+        match rx.recv_timeout(TREE_POLL) {
+            Ok(ctl) => {
+                let result = match ctl {
+                    Ctl::NewWorkspace => client
+                        .new_workspace(NewWorkspaceRequest {
+                            name: Optional::Value("gtk".to_string()),
+                            ..Default::default()
+                        })
+                        .map(|_| ()),
+                    Ctl::Request(Value::Object(request)) => client.request_raw(request).map(|_| ()),
+                    Ctl::Request(_) => Ok(()),
+                };
+                if let Err(error) = result {
+                    let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Served::UiGone,
+        }
+    }
+}
+
+/// Sleep for `wait`, discarding requests that arrive meanwhile. Returns false
+/// when the UI has gone away.
+fn wait_and_drop(rx: &Receiver<Ctl>, wait: Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match rx.recv_timeout(left) {
+            Ok(_) => {} // no session to send it to
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
 }
 
 /// A live byte-mode attachment to one terminal surface.

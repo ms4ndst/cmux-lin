@@ -115,6 +115,7 @@ struct Ui {
     list: gtk::ListBox,
     content: gtk::Box,
     status: gtk::Label,
+    new_ws: gtk::Button,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -209,7 +210,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
     paned.set_position(220);
     window.set_child(Some(&paned));
 
-    let ui = Ui { list: list.clone(), content, status: status.clone() };
+    let ui = Ui { list: list.clone(), content, status: status.clone(), new_ws: new_ws.clone() };
+    set_live(&ui, false);
 
     // --- backend -------------------------------------------------------
     let (ui_tx, ui_rx) = async_channel::unbounded::<UiMsg>();
@@ -280,6 +282,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
         async move {
             while let Ok(msg) = ui_rx.recv().await {
                 match msg {
+                    UiMsg::Connected => set_live(&ui, true),
+                    UiMsg::Disconnected(reason) => on_disconnected(&state, &ui, &reason),
                     UiMsg::Tree(workspaces) => on_tree(&state, &ui, workspaces),
                     UiMsg::Status(text) => ui.status.set_text(&text),
                     UiMsg::Attach { generation, event } => on_attach(&state, &ui, generation, event),
@@ -358,6 +362,30 @@ fn grid(term: &vte4::Terminal) -> (u16, u16) {
     let cols = term.column_count().clamp(0, i64::from(u16::MAX)) as u16;
     let rows = term.row_count().clamp(0, i64::from(u16::MAX)) as u16;
     (cols, rows)
+}
+
+/// Grey the window out (and block input) while the session is unreachable.
+fn set_live(ui: &Ui, live: bool) {
+    ui.list.set_sensitive(live);
+    ui.content.set_sensitive(live);
+    // Insensitive terminals barely change appearance; dim them visibly.
+    ui.content.set_opacity(if live { 1.0 } else { 0.45 });
+    ui.new_ws.set_sensitive(live);
+}
+
+/// The session stopped answering (stopped, or restarting). Close every
+/// attachment but keep the pane widgets: when the session is back, the next
+/// tree re-attaches each pane (a fresh replay) and reuses the layout if it
+/// is unchanged. A session that isn't running yet lands here too.
+fn on_disconnected(state: &Shared, ui: &Ui, reason: &str) {
+    set_live(ui, false);
+    for view in state.borrow_mut().panes.values_mut() {
+        view.detach();
+    }
+    if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+        eprintln!("cmux-gtk: disconnected: {reason}");
+    }
+    ui.status.set_text("Session not running — waiting for it to start…");
 }
 
 /// A new tree from the server: refresh the sidebar and the shown workspace.
