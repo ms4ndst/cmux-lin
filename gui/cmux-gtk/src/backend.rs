@@ -83,9 +83,8 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// The terminal surface to show; `None` for a browser tab or no tabs.
-    pub fn surface(&self) -> Option<u64> {
-        self.tabs.get(self.active_tab).filter(|tab| tab.terminal).map(|tab| tab.surface)
+    pub fn active(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
     }
 }
 
@@ -110,6 +109,9 @@ pub enum UiMsg {
     Connected,
     /// The session stopped answering; the control thread keeps retrying.
     Disconnected(String),
+    /// The built-in browser provider can't start a browser (`Some(why)`), or
+    /// recovered (`None`).
+    BrowserProblem(Option<String>),
     Tree(Vec<Workspace>, Agents),
     /// A posted notification (from `notify`, an agent hook, or the mux).
     Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
@@ -125,6 +127,21 @@ pub enum AttachEvent {
     Output(Vec<u8>),
     Colors(Value),
     Ended(String),
+    /// Browser tab state; the first one after attaching carries the current
+    /// frame.
+    BrowserState { url: String, status: String, error: Option<String>, frame: Option<Frame> },
+    /// A newer browser frame.
+    Frame(Frame),
+}
+
+/// One encoded browser frame (PNG).
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+    /// Guard token that pointer input against this frame must quote; `None`
+    /// means the frame can't authorize pointer input.
+    pub pointer_seq: Option<u64>,
 }
 
 /// Requests from the UI to the control thread.
@@ -328,14 +345,18 @@ pub struct Attachment {
     surface: u64,
     writer: mpsc::Sender<Value>,
     socket: UnixStream,
+    browser: bool,
 }
 
 impl Attachment {
     /// Connect and attach. Events go to `ui` tagged with `generation`.
+    /// `browser` carries the cell size in pixels for a browser tab: the
+    /// server sizes the page as cols × width by rows × height.
     pub fn open(
         socket_path: &PathBuf,
         surface: u64,
         (cols, rows): (u16, u16),
+        browser: Option<(u16, u16)>,
         generation: u64,
         ui: async_channel::Sender<UiMsg>,
     ) -> std::io::Result<Self> {
@@ -376,7 +397,17 @@ impl Attachment {
             }
         });
 
-        let attachment = Self { surface, writer, socket };
+        let attachment = Self { surface, writer, socket, browser: browser.is_some() };
+        if let Some((width_px, height_px)) = browser {
+            // Browser attach requires the pointer-frame-guard capability
+            // (clicks quote the frame they were aimed at), and the page is
+            // sized from this viewer's cell pixels.
+            attachment.request(json!({
+                "cmd": "set-client-info", "name": "cmux-gtk", "kind": "gtk",
+                "capabilities": ["browser-pointer-frame-guard-v1"],
+            }));
+            attachment.request(json!({ "cmd": "set-cell-pixels", "width_px": width_px, "height_px": height_px }));
+        }
         attachment.request(json!({
             "cmd": "attach-surface", "surface": surface, "mode": "bytes", "cols": cols, "rows": rows,
         }));
@@ -392,7 +423,19 @@ impl Attachment {
     /// Send keyboard input or a paste. Input also counts as viewer activity,
     /// which hands size ownership to this window.
     pub fn send(&self, bytes: &[u8]) {
-        self.request(json!({ "cmd": "send", "surface": self.surface, "bytes": B64.encode(bytes) }));
+        if !self.browser {
+            self.request(json!({ "cmd": "send", "surface": self.surface, "bytes": B64.encode(bytes) }));
+        }
+    }
+
+    /// A browser command (`browser-navigate`, `browser-mouse-guarded`, …)
+    /// for this surface; `fields` must be a JSON object.
+    pub fn browser(&self, cmd: &str, mut fields: Value) {
+        if self.browser {
+            fields["cmd"] = json!(cmd);
+            fields["surface"] = json!(self.surface);
+            self.request(fields);
+        }
     }
 
     fn request(&self, request: Value) {
@@ -420,6 +463,23 @@ fn forward(message: &Value, send: &impl Fn(AttachEvent) -> bool) -> bool {
         },
         "output" => send(AttachEvent::Output(data("data").unwrap_or_default())),
         "colors-changed" => send(AttachEvent::Colors(message.clone())),
+        "browser-state" => {
+            let text = |key: &str| message.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+            let pointer_seq = message.get("pointer_frame_seq").and_then(Value::as_u64);
+            send(AttachEvent::BrowserState {
+                url: text("url"),
+                status: text("status"),
+                error: message.get("error").and_then(Value::as_str).map(str::to_string),
+                frame: message.get("frame").and_then(|frame| parse_frame(frame, pointer_seq)),
+            })
+        }
+        "frame" => {
+            let pointer_seq = message.get("pointer_frame_seq").and_then(Value::as_u64);
+            match parse_frame(message, pointer_seq) {
+                Some(frame) => send(AttachEvent::Frame(frame)),
+                None => true,
+            }
+        }
         "detached" => {
             send(AttachEvent::Ended("terminal detached".into()));
             false
@@ -431,6 +491,15 @@ fn forward(message: &Value, send: &impl Fn(AttachEvent) -> bool) -> bool {
         }
         _ => true,
     }
+}
+
+fn parse_frame(frame: &Value, pointer_seq: Option<u64>) -> Option<Frame> {
+    Some(Frame {
+        width: frame.get("width")?.as_u64()? as u32,
+        height: frame.get("height")?.as_u64()? as u32,
+        png: decode(frame.get("data")?.as_str()?),
+        pointer_seq,
+    })
 }
 
 fn decode(data: &str) -> Vec<u8> {

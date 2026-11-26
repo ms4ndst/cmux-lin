@@ -88,6 +88,7 @@ dependencies = [
  "base64",
  "cmux-sdk",
  "gtk4",
+ "libc",
  "serde_json",
  "vte4",
 ]

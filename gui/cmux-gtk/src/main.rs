@@ -7,6 +7,10 @@
 //! own byte-mode attachment (VT replay, then live output); keystrokes and the
 //! widget's cell grid go back over that same attachment.
 //!
+//! Browser tabs show the page the session's browser provider runs (a URL
+//! bar plus streamed frames, with mouse, wheel and keyboard forwarded). If no
+//! provider is registered, the app runs one itself (see `provider.rs`).
+//!
 //! Agent attention (blocked / finished / unread notification / working) is
 //! shown as badges on tabs and sidebar rows; notifications also go to the
 //! desktop, and clicking one jumps to its tab.
@@ -22,6 +26,8 @@
 
 mod attention;
 mod backend;
+mod browser;
+mod provider;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -45,6 +51,8 @@ const CSS: &str = "
 .pane-tabs .tab-active { font-weight: bold; box-shadow: inset 0 -2px @accent_color; }
 .pane-tabs .tab-close { padding: 0 2px; min-width: 0; }
 .pane.focused .pane-tabs { background: alpha(@accent_color, 0.12); }
+.browser-bar { padding: 2px 4px; }
+.browser-bar entry { min-height: 0; }
 ";
 
 /// One pane on screen: its tab strip, its terminal, and the attachment for
@@ -52,7 +60,14 @@ const CSS: &str = "
 struct PaneView {
     root: gtk::Box,
     tabbar: gtk::Box,
+    /// Shows `term` for a terminal tab, `web` for a browser tab.
+    stack: gtk::Stack,
     term: vte4::Terminal,
+    web: browser::WebView,
+    /// Whether the current attachment is a browser tab.
+    browser: bool,
+    /// Whether that browser tab has been seen live on this attachment.
+    browser_live: bool,
     attachment: Option<Attachment>,
     surface: Option<u64>,
     /// Unique per attachment; routes attach events to this pane.
@@ -105,6 +120,10 @@ struct State {
     /// When a notification was last shown in the status line; the workspace
     /// summary doesn't overwrite it for a few seconds.
     noted_at: Option<std::time::Instant>,
+    /// The built-in browser provider (idle if another one is registered).
+    provider: Option<provider::ProviderHandle>,
+    /// Why the built-in provider can't start a browser, if it can't.
+    browser_problem: Option<String>,
 }
 
 impl State {
@@ -208,6 +227,10 @@ fn build_ui(app: &gtk::Application, session: &str) {
 
     let status = gtk::Label::new(Some("Connecting…"));
     status.set_xalign(0.0);
+    // Long messages must never widen the window.
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.set_hexpand(false);
+    status.connect_label_notify(|label| label.set_tooltip_text(Some(&label.text())));
     status.set_margin_start(8);
     status.set_margin_end(8);
     status.set_margin_top(2);
@@ -252,7 +275,25 @@ fn build_ui(app: &gtk::Application, session: &str) {
         window: window.downgrade(),
         app: app.downgrade(),
         noted_at: None,
+        provider: None,
+        browser_problem: None,
     }));
+
+    // Browser tabs need a browser provider; run one unless disabled. It
+    // stays idle when another provider (cmux-browser or a standalone
+    // cmux-browser-provider) already owns the session's lease.
+    if std::env::var_os("CMUX_GTK_NO_PROVIDER").is_none() {
+        let ui_tx = state.borrow().ui_tx.clone();
+        let handle = provider::start(state.borrow().socket_path.clone(), move |report| {
+            let message = match report {
+                provider::Report::Info(line) => UiMsg::Status(line),
+                provider::Report::Problem(problem) => UiMsg::BrowserProblem(Some(problem)),
+                provider::Report::Resolved => UiMsg::BrowserProblem(None),
+            };
+            let _ = ui_tx.send_blocking(message);
+        });
+        state.borrow_mut().provider = Some(handle);
+    }
 
     new_ws.connect_clicked({
         let state = state.clone();
@@ -281,7 +322,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         move || {
             let debug = std::env::var_os("CMUX_GTK_DEBUG").is_some();
             for (id, view) in state.borrow_mut().panes.iter_mut() {
-                let size = grid(&view.term);
+                let size = if view.browser { view.web.grid(cell_pixels(&view.term)) } else { grid(&view.term) };
                 if view.reported == Some(size) || size.0 < 2 || size.1 < 2 {
                     continue;
                 }
@@ -305,6 +346,16 @@ fn build_ui(app: &gtk::Application, session: &str) {
             while let Ok(msg) = ui_rx.recv().await {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
+                    UiMsg::BrowserProblem(problem) => {
+                        if let Some(problem) = &problem {
+                            ui.status.set_text(problem);
+                        }
+                        state.borrow_mut().browser_problem = problem.clone();
+                        // Browser tabs still starting show it in place.
+                        for view in state.borrow().panes.values().filter(|v| v.browser && !v.browser_live) {
+                            view.web.show_problem(problem.as_deref());
+                        }
+                    }
                     UiMsg::Disconnected(reason) => on_disconnected(&state, &ui, &reason),
                     UiMsg::Tree(workspaces, agents) => {
                         state.borrow_mut().agents = agents;
@@ -323,9 +374,14 @@ fn build_ui(app: &gtk::Application, session: &str) {
     window.connect_close_request({
         let state = state.clone();
         move |_| {
-            for view in state.borrow_mut().panes.values_mut() {
-                view.detach();
-            }
+            let provider = {
+                let mut st = state.borrow_mut();
+                for view in st.panes.values_mut() {
+                    view.detach();
+                }
+                st.provider.take()
+            };
+            drop(provider); // unregisters and closes its Chrome
             glib::Propagation::Proceed
         }
     });
@@ -383,6 +439,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>t", |st, pane| st.send(new_tab(pane)));
     bind("<Control><Shift>e", |st, pane| st.send(split(pane, "right")));
     bind("<Control><Shift>o", |st, pane| st.send(split(pane, "down")));
+    bind("<Control><Shift>b", |st, pane| st.send(new_browser_tab(pane)));
     bind("<Control><Shift>w", |st, pane| {
         if let Some(surface) = st.panes.get(&pane).and_then(|v| v.surface) {
             st.send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })));
@@ -399,6 +456,11 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
 
 fn new_tab(pane: u64) -> Ctl {
     Ctl::request(json!({ "cmd": "new-tab", "pane": pane }))
+}
+
+/// A browser tab starts blank; type a URL into its address bar.
+fn new_browser_tab(pane: u64) -> Ctl {
+    Ctl::request(json!({ "cmd": "new-browser-tab", "pane": pane, "url": "about:blank" }))
 }
 
 fn split(pane: u64, dir: &str) -> Ctl {
@@ -530,9 +592,14 @@ fn render(state: &Shared, ui: &Ui) {
     // keep it where it was, if that pane survived).
     if rebuilt {
         let target = state.borrow().target_pane();
-        let term = target.and_then(|id| state.borrow().panes.get(&id).map(|v| v.term.clone()));
-        if let Some(term) = term {
-            term.grab_focus();
+        // Clone the widget out first: grabbing focus runs the focus handler
+        // synchronously, and it needs to borrow the state mutably.
+        let widget: Option<gtk::Widget> = target.and_then(|id| {
+            let st = state.borrow();
+            st.panes.get(&id).map(|v| if v.browser { v.web.focus_widget() } else { v.term.clone().upcast() })
+        });
+        if let Some(widget) = widget {
+            widget.grab_focus();
         }
     }
     update_focus_marks(state);
@@ -727,12 +794,53 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     });
     term.add_controller(focus);
 
+    // Browser input goes over this pane's current (browser) attachment.
+    let send: browser::Send = Rc::new({
+        let state = state.clone();
+        move |cmd, fields| {
+            if let Some(attachment) = state.borrow().panes.get(&id).and_then(|v| v.attachment.as_ref()) {
+                attachment.browser(cmd, fields);
+            }
+        }
+    });
+    let web = browser::WebView::new(send);
+    let web_focus = gtk::EventControllerFocus::new();
+    web_focus.connect_enter({
+        let state = state.clone();
+        move |_| {
+            if state.borrow().focused != Some(id) {
+                state.borrow_mut().focused = Some(id);
+                state.borrow().send(Ctl::request(json!({ "cmd": "focus-pane", "pane": id })));
+                update_focus_marks(&state);
+            }
+        }
+    });
+    web.root.add_controller(web_focus);
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&term, Some("term"));
+    stack.add_named(&web.root, Some("web"));
+    stack.set_visible_child_name("term");
+
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("pane");
     root.append(&tabbar);
-    root.append(&term);
+    root.append(&stack);
 
-    PaneView { root, tabbar, term, attachment: None, surface: None, generation: 0, reported: None, drawn: None }
+    PaneView {
+        root,
+        tabbar,
+        stack,
+        term,
+        web,
+        browser: false,
+        browser_live: false,
+        attachment: None,
+        surface: None,
+        generation: 0,
+        reported: None,
+        drawn: None,
+    }
 }
 
 /// Redraw a pane's tab strip if its tabs changed, and attach to its active
@@ -750,7 +858,8 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
         state.borrow_mut().panes.get_mut(&pane.id).expect("pane view").drawn = Some(drawn);
     }
 
-    let surface = pane.surface();
+    let active = pane.active().cloned();
+    let surface = active.as_ref().map(|tab| tab.surface);
     if state.borrow().panes[&pane.id].surface == surface && surface.is_some() {
         return;
     }
@@ -762,17 +871,38 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
     let view = st.panes.get_mut(&pane.id).expect("pane view");
     view.detach();
     view.generation = generation;
-    view.term.reset(true, true);
-    view.term.feed(b"\x1b[H\x1b[2J\x1b[3J");
-    let Some(surface) = surface else {
-        view.term.feed(b"\r\n  (browser tab: not shown in this prototype)\r\n");
+    view.browser_live = false;
+    let Some(tab) = active else {
+        view.term.reset(true, true);
+        view.term.feed(b"\x1b[H\x1b[2J\x1b[3J");
         return;
     };
-    let size = grid(&view.term);
-    match Attachment::open(&socket_path, surface, (size.0.max(2), size.1.max(2)), generation, ui_tx) {
+    view.browser = !tab.terminal;
+    let (size, cells) = if view.browser {
+        view.stack.set_visible_child_name("web");
+        view.web.clear();
+        let cells = cell_pixels(&view.term);
+        let size = view.web.grid(cells);
+        // Before the page view has a size of its own, estimate it from the
+        // pane (minus the address bar) rather than a fixed 80x24.
+        let size = if size.0 < 2 || size.1 < 2 {
+            let (w, h) = (view.root.width(), view.root.height() - 2 * cells.1 - 8);
+            if w > cells.0 * 2 && h > cells.1 * 2 { ((w / cells.0) as u16, (h / cells.1) as u16) } else { (80, 24) }
+        } else {
+            size
+        };
+        (size, Some((cells.0 as u16, cells.1 as u16)))
+    } else {
+        view.stack.set_visible_child_name("term");
+        view.term.reset(true, true);
+        view.term.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        let size = grid(&view.term);
+        ((size.0.max(2), size.1.max(2)), None)
+    };
+    match Attachment::open(&socket_path, tab.surface, size, cells, generation, ui_tx) {
         Ok(attachment) => {
             view.attachment = Some(attachment);
-            view.surface = Some(surface);
+            view.surface = Some(tab.surface);
             view.reported = Some(size);
         }
         Err(error) => {
@@ -780,6 +910,13 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
             view.term.feed(message.as_bytes());
         }
     }
+}
+
+/// One terminal cell in pixels (from the pane's VTE font, which is set even
+/// while a browser tab is showing); the server sizes browser pages in cells.
+fn cell_pixels(term: &vte4::Terminal) -> (i32, i32) {
+    let (w, h) = (term.char_width() as i32, term.char_height() as i32);
+    if w > 0 && h > 0 { (w, h) } else { (9, 20) }
 }
 
 fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<Attn>]) {
@@ -836,8 +973,9 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
     tabbar.append(&spacer);
 
     let pane_id = pane.id;
-    let actions: [(&str, &str, fn(u64) -> Ctl); 3] = [
+    let actions: [(&str, &str, fn(u64) -> Ctl); 4] = [
         ("+", "New tab (Ctrl+Shift+T)", new_tab),
+        ("🌐", "New browser tab (Ctrl+Shift+B)", new_browser_tab),
         ("┃", "Split right (Ctrl+Shift+E)", |pane| split(pane, "right")),
         ("━", "Split down (Ctrl+Shift+O)", |pane| split(pane, "down")),
     ];
@@ -964,6 +1102,44 @@ fn on_attach(state: &Shared, ui: &Ui, generation: u64, event: AttachEvent) {
     };
     let term = &view.term;
     match event {
+        AttachEvent::BrowserState { url, status, error, frame } => {
+            if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+                let size = frame.as_ref().map(|f| (f.width, f.height, f.pointer_seq));
+                eprintln!("cmux-gtk: browser-state {status} {url} frame {size:?}");
+            }
+            view.web.show_state(&url, &status, error.as_deref(), st.browser_problem.as_deref());
+            if let Some(frame) = frame {
+                if let (Some(seq), Some(attachment)) = (view.web.show_frame(frame), view.attachment.as_ref()) {
+                    attachment.browser("browser-frame-presented", json!({ "frame_seq": seq }));
+                }
+            }
+            if status == "live" && !view.browser_live {
+                // Sizes reported while the page was starting may not have
+                // reached it, and a static page won't repaint by itself.
+                // Report one row less now; the resize tick then reports the
+                // exact grid, a real geometry change that renders a frame.
+                if let (Some(attachment), Some((cols, rows))) = (view.attachment.as_ref(), view.reported) {
+                    attachment.resize(cols, rows.saturating_sub(1).max(1));
+                }
+                drop(st);
+                let mut st = state.borrow_mut();
+                if let Some(view) = st.panes.values_mut().find(|v| v.generation == generation) {
+                    view.browser_live = true;
+                    view.reported = None;
+                }
+                return;
+            }
+        }
+        AttachEvent::Frame(frame) => {
+            if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+                eprintln!("cmux-gtk: frame {}x{} seq {:?}", frame.width, frame.height, frame.pointer_seq);
+            }
+            // Acknowledge each frame once it's on screen; only then may
+            // pointer input be aimed at it.
+            if let (Some(seq), Some(attachment)) = (view.web.show_frame(frame), view.attachment.as_ref()) {
+                attachment.browser("browser-frame-presented", json!({ "frame_seq": seq }));
+            }
+        }
         AttachEvent::Replay { data, colors } => {
             if let Some(colors) = colors {
                 apply_colors(term, &colors);
