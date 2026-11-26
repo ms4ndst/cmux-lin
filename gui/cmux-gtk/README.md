@@ -13,6 +13,7 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - double-click a workspace, screen or tab to rename it; an empty name goes back to the default;
 - drag a tab to reorder it, onto another pane's tab strip or body to move it there, onto a workspace in the sidebar to move it to that workspace, or into the empty sidebar space for a new workspace. The terminal or browser keeps running;
 - the pane menu also has **Undo layout change** (`Ctrl+Shift+U`, the screen's last split, swap, zoom or resize) and **Move tab to new workspace**. An undo that would close panes asks first and says how many;
+- screens laid out in viewport columns (the TUI's `Ctrl-b g`, here `Ctrl+Shift+G` or the pane menu's **New column to the right**) show as a horizontally scrolling row: each column is its own fraction of the visible width, has its own splits inside, and resizes by dragging its right edge;
 - a zoomed pane fills its screen (zoom from the pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom;
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
 - keystrokes and pastes go to the pane you're typing in;
@@ -82,6 +83,7 @@ They act on the pane you're typing in:
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
 | `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
+| `Ctrl+Shift+G` | New column to the right (viewport columns) |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
 
@@ -116,7 +118,6 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 ## Not done
 
 - moving whole panes between workspaces (tabs move; a pane empties and closes);
-- the TUI's viewport (scrolling column) layouts;
 - the TUI's sidebar views (machines, files, custom sidebar plugins);
 
 ## Debugging

@@ -52,6 +52,9 @@ pub struct Workspace {
     pub active_pane: Option<u64>,
     /// The active screen's zoomed pane, shown alone while set.
     pub zoomed: Option<u64>,
+    /// The active screen's viewport columns (empty for an ordinary tiled
+    /// screen).
+    pub columns: Vec<Column>,
 }
 
 impl Workspace {
@@ -71,6 +74,16 @@ pub struct Screen {
     pub panes: Vec<Pane>,
     pub active_pane: Option<u64>,
     pub zoomed: Option<u64>,
+    pub columns: Vec<Column>,
+}
+
+/// A viewport column (TUI `Ctrl-b g`): its own split tree, `width` a
+/// fraction of the visible width; columns past the edge scroll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Column {
+    pub id: u64,
+    pub width: f64,
+    pub layout: Layout,
 }
 
 /// The active screen's split tree.
@@ -602,9 +615,9 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 .map(|screens| screens.iter().filter_map(parse_screen).collect())
                 .unwrap_or_default();
             let shown = screens.iter().find(|s| s.active).or_else(|| screens.first()).cloned();
-            let (screen, layout, panes, active_pane, zoomed) = match shown {
-                Some(s) => (Some(s.id), s.layout, s.panes, s.active_pane, s.zoomed),
-                None => (None, None, Vec::new(), None, None),
+            let (screen, layout, panes, active_pane, zoomed, columns) = match shown {
+                Some(s) => (Some(s.id), s.layout, s.panes, s.active_pane, s.zoomed, s.columns),
+                None => (None, None, Vec::new(), None, None, Vec::new()),
             };
             let title = active_pane
                 .and_then(|id| panes.iter().find(|p| p.id == id))
@@ -622,6 +635,7 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 panes,
                 active_pane,
                 zoomed,
+                columns,
             }
         })
         .collect()
@@ -640,6 +654,24 @@ fn parse_screen(screen: &Value) -> Option<Screen> {
             .unwrap_or_default(),
         active_pane: screen.get("active_pane").and_then(Value::as_u64),
         zoomed: screen.get("zoomed_pane").and_then(Value::as_u64),
+        // Viewport columns; a lone full-width column is an ordinary screen.
+        columns: screen
+            .get("columns")
+            .and_then(Value::as_array)
+            .map(|columns| {
+                columns
+                    .iter()
+                    .filter_map(|c| {
+                        Some(Column {
+                            id: c.get("id")?.as_u64()?,
+                            width: c.get("width").and_then(Value::as_f64).unwrap_or(1.0),
+                            layout: parse_layout(c.get("layout")?)?,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|columns| columns.len() > 1)
+            .unwrap_or_default(),
     })
 }
 

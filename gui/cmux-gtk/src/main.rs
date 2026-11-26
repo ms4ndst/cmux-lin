@@ -39,7 +39,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use attention::Attn;
-use backend::{Agents, AttachEvent, Attachment, Ctl, Layout, Pane, UiMsg, Workspace};
+use backend::{Agents, AttachEvent, Attachment, Column, Ctl, Layout, Pane, UiMsg, Workspace};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use serde_json::{Value, json};
@@ -49,6 +49,8 @@ const APP_ID: &str = "dev.cmuxlin.CmuxGtk";
 
 const CSS: &str = "
 .pane-tabs { padding: 2px 4px; }
+.column-handle { min-width: 4px; background: alpha(currentColor, 0.15); }
+.column-handle:hover { background: @accent_color; }
 .screen-strip { padding: 2px 6px; border-bottom: 1px solid alpha(currentColor, 0.15); }
 .screen-strip button { padding: 2px 8px; min-height: 0; }
 .screen-strip .tab-active { font-weight: bold; box-shadow: inset 0 -2px @accent_color; }
@@ -98,6 +100,21 @@ impl PaneView {
     }
 }
 
+/// A built viewport-column row: the scroller (whose width is "the
+/// viewport") and each column with its width fraction and a pane in it (the
+/// handle `set-viewport-pane-width` takes).
+struct ViewportView {
+    scroller: gtk::ScrolledWindow,
+    columns: Vec<ColumnView>,
+}
+
+struct ColumnView {
+    id: u64,
+    widget: gtk::Box,
+    fraction: Rc<Cell<f64>>,
+    dragging: Rc<Cell<bool>>,
+}
+
 /// A built divider: the ratio it holds and a function that re-applies it.
 struct SplitView {
     ratio: Rc<Cell<f64>>,
@@ -124,6 +141,8 @@ struct State {
     raw: Vec<Workspace>,
     /// Widgets, for handlers that change the selection and redraw.
     ui: Option<Ui>,
+    /// The viewport-column row when the shown screen uses columns.
+    viewport: Option<ViewportView>,
     /// Live pane views of the shown workspace, by pane id.
     panes: HashMap<u64, PaneView>,
     /// Workspace id + layout signature currently built.
@@ -303,6 +322,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         known: None,
         raw: Vec::new(),
         ui: None,
+        viewport: None,
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -393,6 +413,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     glib::timeout_add_local(Duration::from_millis(200), {
         let state = state.clone();
         move || {
+            size_columns(&state);
             let debug = std::env::var_os("CMUX_GTK_DEBUG").is_some();
             for (id, view) in state.borrow_mut().panes.iter_mut() {
                 let size = if view.browser { view.web.grid(cell_pixels(&view.term)) } else { grid(&view.term) };
@@ -569,6 +590,9 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>o", |st, pane| st.borrow().send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.borrow().send(new_browser_tab(pane)));
     bind("<Control><Shift>u", |st, pane| st.borrow().send(Ctl::Undo { pane, confirm: None }));
+    bind("<Control><Shift>g", |st, pane| {
+        st.borrow().send(Ctl::request(json!({ "cmd": "new-pane-right", "pane": pane })));
+    });
     bind("<Control><Shift>z", |st, pane| {
         st.borrow().send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })));
     });
@@ -726,6 +750,7 @@ fn apply_choices(raw: &[Workspace], screens: &HashMap<u64, u64>, tabs: &HashMap<
                 ws.panes = screen.panes;
                 ws.active_pane = screen.active_pane;
                 ws.zoomed = screen.zoomed;
+                ws.columns = screen.columns;
             }
             ws.title = ws
                 .active_pane
@@ -985,19 +1010,39 @@ fn render(state: &Shared, ui: &Ui) {
         return;
     };
     // A zoomed pane is shown alone; the split tree is kept for unzooming.
-    let layout = match ws.zoomed {
-        Some(pane) if layout.panes().contains(&pane) => Layout::Leaf(pane),
-        _ => layout,
+    let zoomed = ws.zoomed.filter(|pane| layout.panes().contains(pane));
+    let layout = match zoomed {
+        Some(pane) => Layout::Leaf(pane),
+        None => layout,
     };
+    // Viewport columns, unless a pane is zoomed (then it's shown alone).
+    let columns = if zoomed.is_some() { Vec::new() } else { ws.columns.clone() };
 
-    let signature = format!("{}:{}:{}", ws.id, ws.screen.unwrap_or(0), layout.signature());
+    let shape = if columns.is_empty() {
+        layout.signature()
+    } else {
+        let cols: Vec<String> = columns.iter().map(|c| format!("{}={}", c.id, c.layout.signature())).collect();
+        format!("cols[{}]", cols.join(","))
+    };
+    let signature = format!("{}:{}:{}", ws.id, ws.screen.unwrap_or(0), shape);
     let rebuilt = state.borrow().built.as_deref() != Some(&signature);
     if rebuilt {
-        rebuild(state, ui, &layout);
+        if columns.is_empty() {
+            rebuild(state, ui, &layout);
+        } else {
+            rebuild_columns(state, ui, &columns);
+        }
         state.borrow_mut().built = Some(signature);
     }
 
-    sync_ratios(state, &layout);
+    if columns.is_empty() {
+        sync_ratios(state, &layout);
+    } else {
+        sync_columns(state, &columns);
+        for column in &columns {
+            sync_ratios(state, &column.layout);
+        }
+    }
     for pane in &ws.panes {
         if state.borrow().panes.contains_key(&pane.id) {
             refresh_pane(state, pane);
@@ -1045,6 +1090,7 @@ fn clear_content(state: &Shared, ui: &Ui) {
     }
     let mut st = state.borrow_mut();
     st.panes.clear(); // drops attachments
+    st.viewport = None;
     st.splits.clear();
     st.built = None;
 }
@@ -1059,6 +1105,7 @@ fn rebuild(state: &Shared, ui: &Ui, layout: &Layout) {
     let wanted = layout.panes();
     {
         let mut st = state.borrow_mut();
+        st.viewport = None;
         st.splits.clear();
         // A different workspace shares no panes; drop views that left.
         st.panes.retain(|id, _| wanted.contains(id));
@@ -1082,6 +1129,144 @@ fn dismantle(widget: &gtk::Widget) {
         paned.set_end_child(None::<&gtk::Widget>);
         for child in [start, end].into_iter().flatten() {
             dismantle(&child);
+        }
+    } else if let Some(scroller) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+        if let Some(child) = scroller.child() {
+            dismantle(&child);
+        }
+        scroller.set_child(None::<&gtk::Widget>);
+    } else if let Some(viewport) = widget.downcast_ref::<gtk::Viewport>() {
+        if let Some(child) = viewport.child() {
+            dismantle(&child);
+        }
+        viewport.set_child(None::<&gtk::Widget>);
+    } else if let Some(container) = widget.downcast_ref::<gtk::Box>() {
+        // Only the column row and columns; a pane's own box stays intact.
+        if container.has_css_class("viewport-row") || container.has_css_class("viewport-column") {
+            for child in content_children(container) {
+                dismantle(&child);
+                container.remove(&child);
+            }
+        }
+    }
+}
+
+/// Build a screen that uses viewport columns: a horizontally scrolling row
+/// of columns, each its fraction of the visible width, each with its own
+/// split tree, and a drag handle on its right edge to resize it.
+fn rebuild_columns(state: &Shared, ui: &Ui, columns: &[Column]) {
+    if let Some(child) = ui.content.first_child() {
+        dismantle(&child);
+        ui.content.remove(&child);
+    }
+    let wanted: Vec<u64> = columns.iter().flat_map(|c| c.layout.panes()).collect();
+    {
+        let mut st = state.borrow_mut();
+        st.viewport = None;
+        st.splits.clear();
+        st.panes.retain(|id, _| wanted.contains(id));
+    }
+    for id in &wanted {
+        if !state.borrow().panes.contains_key(id) {
+            let view = new_pane_view(state, *id);
+            state.borrow_mut().panes.insert(*id, view);
+        }
+    }
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("viewport-row");
+    let viewport = gtk::Viewport::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    viewport.set_child(Some(&row));
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&viewport)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+
+    let ctl = state.borrow().ctl.clone();
+    let mut views = Vec::new();
+    for column in columns {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        widget.add_css_class("viewport-column");
+        let inner = build_layout(state, &column.layout);
+        inner.set_hexpand(true);
+        widget.append(&inner);
+        row.append(&widget);
+
+        // Right-edge handle: drag to resize, sent on release.
+        let handle = gtk::Separator::new(gtk::Orientation::Vertical);
+        handle.add_css_class("column-handle");
+        handle.set_cursor_from_name(Some("col-resize"));
+        let fraction = Rc::new(Cell::new(column.width));
+        let dragging = Rc::new(Cell::new(false));
+        let drag = gtk::GestureDrag::new();
+        let start = Rc::new(Cell::new(0.0));
+        drag.connect_drag_begin({
+            let (widget, start, dragging) = (widget.clone(), start.clone(), dragging.clone());
+            move |_, _, _| {
+                start.set(f64::from(widget.width()));
+                dragging.set(true);
+            }
+        });
+        drag.connect_drag_update({
+            let (widget, scroller, start, fraction) = (widget.clone(), scroller.clone(), start.clone(), fraction.clone());
+            move |_, dx, _| {
+                let total = f64::from(scroller.width().max(1));
+                let value = ((start.get() + dx) / total).clamp(0.1, 1.0);
+                fraction.set(value);
+                widget.set_size_request((value * total).round() as i32, -1);
+            }
+        });
+        let pane = column.layout.panes().first().copied();
+        drag.connect_drag_end({
+            let (fraction, dragging, ctl) = (fraction.clone(), dragging.clone(), ctl.clone());
+            move |_, _, _| {
+                dragging.set(false);
+                if let Some(pane) = pane {
+                    let request = json!({ "cmd": "set-viewport-pane-width", "pane": pane, "width": fraction.get() });
+                    let _ = ctl.send(Ctl::request(request));
+                }
+            }
+        });
+        handle.add_controller(drag);
+        row.append(&handle);
+        views.push(ColumnView { id: column.id, widget, fraction, dragging });
+    }
+    ui.content.append(&scroller);
+    state.borrow_mut().viewport = Some(ViewportView { scroller, columns: views });
+    size_columns(state);
+}
+
+/// Take column widths from the tree (unless one is being dragged), then
+/// size them.
+fn sync_columns(state: &Shared, columns: &[Column]) {
+    if let Some(viewport) = state.borrow().viewport.as_ref() {
+        for view in &viewport.columns {
+            if let Some(column) = columns.iter().find(|c| c.id == view.id) {
+                if !view.dragging.get() {
+                    view.fraction.set(column.width);
+                }
+            }
+        }
+    }
+    size_columns(state);
+}
+
+/// Size each column to its fraction of the visible width (re-run as the
+/// window resizes).
+fn size_columns(state: &Shared) {
+    let st = state.borrow();
+    let Some(viewport) = st.viewport.as_ref() else { return };
+    let total = viewport.scroller.width();
+    if total <= 0 {
+        return;
+    }
+    for view in &viewport.columns {
+        let width = (view.fraction.get() * f64::from(total)).round() as i32;
+        if view.widget.width_request() != width {
+            view.widget.set_size_request(width, -1);
         }
     }
 }
@@ -1485,6 +1670,7 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
     let menu = gio::Menu::new();
     let view = gio::Menu::new();
     view.append(Some("Zoom / unzoom (Ctrl+Shift+Z)"), Some("pane.zoom"));
+    view.append(Some("New column to the right (Ctrl+Shift+G)"), Some("pane.new-column"));
     menu.append_section(None, &view);
     let swap = gio::Menu::new();
     for (label, dir) in [("Swap with left", "left"), ("Swap with right", "right"), ("Swap with above", "up"), ("Swap with below", "down")] {
@@ -1520,6 +1706,12 @@ fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: 
         move |_, _| send(json!({ "cmd": "zoom-pane", "pane": id, "mode": "toggle" }))
     });
     group.add_action(&zoom);
+    let new_column = gio::SimpleAction::new("new-column", None);
+    new_column.connect_activate({
+        let send = send.clone();
+        move |_, _| send(json!({ "cmd": "new-pane-right", "pane": id }))
+    });
+    group.add_action(&new_column);
     let swap = gio::SimpleAction::new("swap", Some(glib::VariantTy::STRING));
     swap.connect_activate({
         let send = send.clone();
