@@ -35,7 +35,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -503,9 +503,37 @@ pub fn link_at(socket_path: &Path, tab_id: &str, x: f64, y: f64) -> Result<Optio
     Ok(value.as_str().filter(|href| !href.is_empty()).map(str::to_string))
 }
 
+/// A DevTools WebSocket on a page.
+type PageSocket = tungstenite::WebSocket<TcpStream>;
+
 /// Evaluate `expression` in the page of browser tab `tab_id` and return its
 /// value (by value, JSON).
-fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Value, String> {
+pub fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Value, String> {
+    let mut socket = page_socket(socket_path, tab_id)?;
+    let request = json!({
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": { "expression": expression, "returnByValue": true },
+    });
+    socket.send(tungstenite::Message::text(request.to_string())).map_err(|e| e.to_string())?;
+    loop {
+        let message = socket.read().map_err(|e| e.to_string())?;
+        let Ok(text) = message.to_text() else { continue };
+        let Ok(reply) = serde_json::from_str::<Value>(text) else { continue };
+        if reply.get("id").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        let _ = socket.close(None);
+        if let Some(error) = reply.get("error") {
+            return Err(error.get("message").and_then(Value::as_str).unwrap_or("evaluation failed").to_string());
+        }
+        return Ok(reply.pointer("/result/result/value").cloned().unwrap_or(Value::Null));
+    }
+}
+
+/// Open a DevTools connection to the page of browser tab `tab_id`, using the
+/// endpoint and target the session's provider registered. Loopback only.
+fn page_socket(socket_path: &Path, tab_id: &str) -> Result<PageSocket, String> {
     let mut session = Session::connect(socket_path).map_err(|e| e.to_string())?;
     let provider = session.request(json!({ "cmd": "get-browser-provider" }))?;
     if provider.get("available") != Some(&Value::Bool(true)) {
@@ -540,24 +568,107 @@ fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Value,
     let url = format!("ws://{authority}/devtools/page/{target}");
     let stream = TcpStream::connect((host.trim_matches(|c| c == '[' || c == ']'), port)).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let (mut socket, _) = tungstenite::client(url.as_str(), stream).map_err(|e| e.to_string())?;
-    let request = json!({
-        "id": 1,
-        "method": "Runtime.evaluate",
-        "params": { "expression": expression, "returnByValue": true },
-    });
-    socket.send(tungstenite::Message::text(request.to_string())).map_err(|e| e.to_string())?;
-    loop {
-        let message = socket.read().map_err(|e| e.to_string())?;
-        let Ok(text) = message.to_text() else { continue };
-        let Ok(reply) = serde_json::from_str::<Value>(text) else { continue };
-        if reply.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
-        }
-        let _ = socket.close(None);
-        if let Some(error) = reply.get("error") {
-            return Err(error.get("message").and_then(Value::as_str).unwrap_or("evaluation failed").to_string());
-        }
-        return Ok(reply.pointer("/result/result/value").cloned().unwrap_or(Value::Null));
+    let (socket, _) = tungstenite::client(url.as_str(), stream).map_err(|e| e.to_string())?;
+    Ok(socket)
+}
+
+/// A page asked for a file (its `<input type=file>` was activated).
+#[derive(Debug, Clone)]
+pub struct FileChooser {
+    /// The input element, for [`FileChooserWatch::set_files`].
+    pub node: i64,
+    /// Whether the input accepts several files.
+    pub multiple: bool,
+}
+
+/// Intercepts file pickers in one browser tab. A headless browser can't show
+/// a file dialog, so the page reports the request instead and the host
+/// answers it with [`set_files`](Self::set_files). Dropping it stops
+/// watching (pickers are then ignored again).
+pub struct FileChooserWatch {
+    files: mpsc::Sender<(i64, Vec<String>)>,
+    stop: Arc<AtomicBool>,
+}
+
+impl FileChooserWatch {
+    /// Give the page's file input `node` these local files (absolute paths).
+    pub fn set_files(&self, node: i64, paths: Vec<String>) {
+        let _ = self.files.send((node, paths));
     }
+}
+
+impl Drop for FileChooserWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Start intercepting file pickers in browser tab `tab_id`; `on_open` runs
+/// (on the watcher's thread) for each request. Connects in the background
+/// and retries until the tab has a page, so it can start with the tab.
+pub fn watch_file_choosers(
+    socket_path: &Path,
+    tab_id: &str,
+    on_open: impl Fn(FileChooser) + Send + 'static,
+) -> FileChooserWatch {
+    let (files, requests) = mpsc::channel::<(i64, Vec<String>)>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (socket_path, tab_id, thread_stop) = (socket_path.to_path_buf(), tab_id.to_string(), stop.clone());
+    std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Acquire) {
+            if let Ok(socket) = page_socket(&socket_path, &tab_id) {
+                watch(socket, &requests, &thread_stop, &on_open);
+            }
+            sleep(&thread_stop, Duration::from_secs(1));
+        }
+    });
+    FileChooserWatch { files, stop }
+}
+
+/// Serve one page connection until it closes or we're stopped.
+fn watch(
+    mut socket: PageSocket,
+    requests: &mpsc::Receiver<(i64, Vec<String>)>,
+    stop: &AtomicBool,
+    on_open: &dyn Fn(FileChooser),
+) {
+    // Short reads, so queued answers go out promptly.
+    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(200)));
+    let mut next_id = 1u64;
+    let mut call = |socket: &mut PageSocket, method: &str, params: Value| {
+        let message = json!({ "id": next_id, "method": method, "params": params });
+        next_id += 1;
+        socket.send(tungstenite::Message::text(message.to_string())).is_ok()
+    };
+    if !call(&mut socket, "Page.enable", json!({}))
+        || !call(&mut socket, "Page.setInterceptFileChooserDialog", json!({ "enabled": true }))
+    {
+        return;
+    }
+    while !stop.load(Ordering::Acquire) {
+        while let Ok((node, files)) = requests.try_recv() {
+            if !call(&mut socket, "DOM.setFileInputFiles", json!({ "backendNodeId": node, "files": files })) {
+                return;
+            }
+        }
+        match socket.read() {
+            Ok(message) => {
+                let Ok(text) = message.to_text() else { continue };
+                let Ok(event) = serde_json::from_str::<Value>(text) else { continue };
+                if event.get("method").and_then(Value::as_str) == Some("Page.fileChooserOpened") {
+                    let params = event.get("params").cloned().unwrap_or(Value::Null);
+                    if let Some(node) = params.get("backendNodeId").and_then(Value::as_i64) {
+                        on_open(FileChooser {
+                            node,
+                            multiple: params.get("mode").and_then(Value::as_str) == Some("selectMultiple"),
+                        });
+                    }
+                }
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => return, // page or browser went away; the caller reconnects
+        }
+    }
+    let _ = socket.close(None);
 }

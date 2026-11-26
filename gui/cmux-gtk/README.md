@@ -39,6 +39,8 @@ Select text as in any browser: drag, double-click a word, triple-click a line, S
 | `Ctrl+X` | Cut (copy, then delete the selection in a text field) |
 | `Ctrl+V`, `Ctrl+Shift+V` or `Shift+Insert` | Paste |
 
+File uploads work as usual: activate a page's file field and the desktop file dialog opens, picking one file or several as the field allows, and the chosen files go to the page. A headless browser can't show a file dialog, so the window intercepts the page's request over DevTools (`Page.setInterceptFileChooserDialog`) and answers it with the files you pick (`DOM.setFileInputFiles`). Cancelling leaves the field empty. Only local files can be uploaded.
+
 Right-click a page for a menu: **Open link in new tab** and **Copy link address** when over a link, then Back, Forward, Reload, Copy, Paste, Select all, and **Open page in default browser** (hands the page to your desktop browser). The Menu key or Shift+F10 opens it from the keyboard. **Shift+right-click** sends the click to the page instead, for sites with their own context menus. The headless browser never shows menus itself, and the window finds the link under the pointer by asking the page over DevTools.
 
 The page runs in a headless browser whose own clipboard isn't the desktop's, so the window handles the clipboard itself. Copy asks the page for its selection over the DevTools Protocol (the selected part of a focused text field, otherwise the page selection), using the endpoint the provider registered, since the session protocol's `copy` only covers terminals. Paste types the clipboard text into the page. Both are also exposed as the actions `app.browser-copy` and `app.browser-paste`, and the menu as `app.browser-menu`.
@@ -105,7 +107,6 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 
 - multiple screens per workspace (only the active screen is shown);
 - switching workspaces on the server when you click one (the click is local);
-- file uploads in browser tabs (selection, copy/paste, context menu, pointer, scroll and typing work);
 - zoom, pane swap, and other layout commands beyond split/close;
 
 ## Debugging

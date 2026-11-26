@@ -118,6 +118,9 @@ pub enum UiMsg {
     /// The selection read from a browser tab for copy (or cut), for the
     /// attachment with this `generation`.
     Copied { generation: u64, result: Result<String, String>, cut: bool },
+    /// A page in the attachment with this `generation` asked for a file:
+    /// show a file dialog and answer with [`provider::FileChooserWatch`].
+    FileChooser { generation: u64, node: i64, multiple: bool },
     /// Show the browser tab's context menu at widget point (`x`, `y`), with
     /// the link found under it, if any.
     ContextMenu { generation: u64, x: f64, y: f64, link: Option<String> },

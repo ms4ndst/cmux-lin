@@ -72,6 +72,8 @@ struct PaneView {
     browser_live: bool,
     /// The browser tab's stable id, for reading its selection.
     browser_tab: Option<String>,
+    /// Intercepts the browser tab's file pickers (uploads).
+    uploads: Option<provider::FileChooserWatch>,
     attachment: Option<Attachment>,
     surface: Option<u64>,
     /// Unique per attachment; routes attach events to this pane.
@@ -86,6 +88,7 @@ impl PaneView {
         // Dropping the attachment closes its connection, which also removes
         // this viewer's size report on the server.
         self.attachment = None;
+        self.uploads = None;
         self.surface = None;
         self.reported = None;
     }
@@ -351,6 +354,9 @@ fn build_ui(app: &gtk::Application, session: &str) {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
                     UiMsg::Copied { generation, result, cut } => on_copied(&state, &ui, generation, result, cut),
+                    UiMsg::FileChooser { generation, node, multiple } => {
+                        choose_files(&state, &ui, generation, node, multiple);
+                    }
                     UiMsg::ContextMenu { generation, x, y, link } => {
                         let show = state
                             .borrow()
@@ -923,6 +929,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         browser: false,
         browser_live: false,
         browser_tab: None,
+        uploads: None,
         attachment: None,
         surface: None,
         generation: 0,
@@ -967,6 +974,14 @@ fn refresh_pane(state: &Shared, pane: &Pane) {
     };
     view.browser = !tab.terminal;
     view.browser_tab = if view.browser { tab.tab_id.clone() } else { None };
+    // A headless page can't show a file dialog: watch for its requests and
+    // answer them from ours.
+    view.uploads = view.browser_tab.as_ref().map(|tab_id| {
+        let ui_tx = ui_tx.clone();
+        provider::watch_file_choosers(&socket_path, tab_id, move |chooser| {
+            let _ = ui_tx.send_blocking(UiMsg::FileChooser { generation, node: chooser.node, multiple: chooser.multiple });
+        })
+    });
     let (size, cells) = if view.browser {
         view.stack.set_visible_child_name("web");
         view.web.clear();
@@ -1182,6 +1197,49 @@ fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
     if let Some(window) = state.borrow().window.upgrade() {
         window.present();
     }
+}
+
+/// A page asked for a file: show the desktop file dialog (one file or
+/// several, as the page's input allows) and give the page what was picked.
+/// Cancelling leaves the input as it was.
+fn choose_files(state: &Shared, ui: &Ui, generation: u64, node: i64, multiple: bool) {
+    if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+        eprintln!("cmux-gtk: page asks for {} (input node {node})", if multiple { "files" } else { "a file" });
+    }
+    let Some(window) = state.borrow().window.upgrade() else { return };
+    let dialog = gtk::FileDialog::builder()
+        .title(if multiple { "Choose files to upload" } else { "Choose a file to upload" })
+        .modal(true)
+        .build();
+    let (state, status) = (state.clone(), ui.status.clone());
+    glib::spawn_future_local(async move {
+        let files: Vec<gio::File> = if multiple {
+            match dialog.open_multiple_future(Some(&window)).await {
+                Ok(list) => (0..list.n_items()).filter_map(|i| list.item(i).and_downcast::<gio::File>()).collect(),
+                Err(_) => return, // cancelled
+            }
+        } else {
+            match dialog.open_future(Some(&window)).await {
+                Ok(file) => vec![file],
+                Err(_) => return,
+            }
+        };
+        let paths: Vec<String> =
+            files.iter().filter_map(|f| f.path()).map(|p| p.to_string_lossy().into_owned()).collect();
+        if paths.is_empty() {
+            status.set_text("Only local files can be uploaded");
+            return;
+        }
+        let count = paths.len();
+        let st = state.borrow();
+        match st.panes.values().find(|v| v.generation == generation).and_then(|v| v.uploads.as_ref()) {
+            Some(uploads) => {
+                uploads.set_files(node, paths);
+                status.set_text(&format!("Uploading {count} file{}", if count == 1 { "" } else { "s" }));
+            }
+            None => status.set_text("The page changed before the files were chosen"),
+        }
+    });
 }
 
 /// A browser tab's selection arrived: put it on the desktop clipboard, and
