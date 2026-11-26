@@ -1,0 +1,534 @@
+{
+  "theme": {
+    "chrome": "dark",
+    "border_style": "rounded",
+    "border_active": "#89b4fa",
+    "border_inactive": "#7f849c",
+    "notification_info": "#89b4fa",
+    "notification_warning": "#f9e2af",
+    "notification_error": "#f38ba8",
+    "sidebar_rail": "#89b4fa",
+    "sidebar_active_bg": "#313244",
+    "sidebar_fg": "#bac2de",
+    "sidebar_selected_fg": "#cdd6f4",
+    "tab_rail": "#89b4fa",
+    "tab_bg": "#313244",
+    "tab_active_bg": "#45475a",
+    "status_bg": "#11111b",
+    "status_fg": "#bac2de",
+    "selection_background": "#585b70",
+    "dim_inactive": true
+  },
+  "tabs": {
+    "style": "pill",
+    "show_titles": true,
+    "solid_background": true,
+    "plus": {
+      "menu": [
+        {
+          "action": "command:theme_set_latte-light",
+          "label": "Latte Light"
+        },
+        {
+          "action": "command:theme_set_mocha-blue",
+          "label": "Mocha-blue"
+        },
+        {
+          "action": "command:theme_set_mocha-contrast",
+          "label": "Mocha-contrast"
+        },
+        {
+          "action": "command:theme_set_mocha-mauve",
+          "label": "Mocha-mauve"
+        },
+        {
+          "action": "command:theme_set_sw-ayu-dark",
+          "label": "Sw-ayu Dark"
+        },
+        {
+          "action": "command:theme_set_sw-ayu-light",
+          "label": "Sw-ayu Light"
+        },
+        {
+          "action": "command:theme_set_sw-catppuccin-dark",
+          "label": "Sw-catppuccin Dark"
+        },
+        {
+          "action": "command:theme_set_sw-catppuccin-light",
+          "label": "Sw-catppuccin Light"
+        },
+        {
+          "action": "command:theme_set_sw-dracula-dark",
+          "label": "Sw-dracula Dark"
+        },
+        {
+          "action": "command:theme_set_sw-dracula-light",
+          "label": "Sw-dracula Light"
+        },
+        {
+          "action": "command:theme_set_sw-eldritch-dark",
+          "label": "Sw-eldritch Dark"
+        },
+        {
+          "action": "command:theme_set_sw-eldritch-light",
+          "label": "Sw-eldritch Light"
+        },
+        {
+          "action": "command:theme_set_sw-everforest-dark",
+          "label": "Sw-everforest Dark"
+        },
+        {
+          "action": "command:theme_set_sw-everforest-light",
+          "label": "Sw-everforest Light"
+        },
+        {
+          "action": "command:theme_set_sw-gruvbox-dark",
+          "label": "Sw-gruvbox Dark"
+        },
+        {
+          "action": "command:theme_set_sw-gruvbox-light",
+          "label": "Sw-gruvbox Light"
+        },
+        {
+          "action": "command:theme_set_sw-kanagawa-dark",
+          "label": "Sw-kanagawa Dark"
+        },
+        {
+          "action": "command:theme_set_sw-kanagawa-light",
+          "label": "Sw-kanagawa Light"
+        },
+        {
+          "action": "command:theme_set_sw-monokai-pro-dark",
+          "label": "Sw-monokai-pro Dark"
+        },
+        {
+          "action": "command:theme_set_sw-monokai-pro-light",
+          "label": "Sw-monokai-pro Light"
+        },
+        {
+          "action": "command:theme_set_sw-noctalia-dark",
+          "label": "Sw-noctalia Dark"
+        },
+        {
+          "action": "command:theme_set_sw-noctalia-light",
+          "label": "Sw-noctalia Light"
+        },
+        {
+          "action": "command:theme_set_sw-nord-dark",
+          "label": "Sw-nord Dark"
+        },
+        {
+          "action": "command:theme_set_sw-nord-light",
+          "label": "Sw-nord Light"
+        },
+        {
+          "action": "command:theme_set_sw-one-dark",
+          "label": "Sw-one Dark"
+        },
+        {
+          "action": "command:theme_set_sw-one-light",
+          "label": "Sw-one Light"
+        },
+        {
+          "action": "command:theme_set_sw-oxocarbon-dark",
+          "label": "Sw-oxocarbon Dark"
+        },
+        {
+          "action": "command:theme_set_sw-oxocarbon-light",
+          "label": "Sw-oxocarbon Light"
+        },
+        {
+          "action": "command:theme_set_sw-ros-pine-dark",
+          "label": "Sw-ros-pine Dark"
+        },
+        {
+          "action": "command:theme_set_sw-ros-pine-light",
+          "label": "Sw-ros-pine Light"
+        },
+        {
+          "action": "command:theme_set_sw-solarized-dark",
+          "label": "Sw-solarized Dark"
+        },
+        {
+          "action": "command:theme_set_sw-solarized-light",
+          "label": "Sw-solarized Light"
+        },
+        {
+          "action": "command:theme_set_sw-synthwave-84-dark",
+          "label": "Sw-synthwave-84 Dark"
+        },
+        {
+          "action": "command:theme_set_sw-synthwave-84-light",
+          "label": "Sw-synthwave-84 Light"
+        },
+        {
+          "action": "command:theme_set_sw-tokyo-night-dark",
+          "label": "Sw-tokyo-night Dark"
+        },
+        {
+          "action": "command:theme_set_sw-tokyo-night-light",
+          "label": "Sw-tokyo-night Light"
+        },
+        {
+          "action": "command:theme_set_default",
+          "label": "Default (upstream)"
+        }
+      ]
+    }
+  },
+  "commands": [
+    {
+      "id": "quit-session",
+      "name": "Quit session (stop server)",
+      "keys": "Q",
+      "run": [
+        "sh",
+        "-c",
+        "exec cmux server stop --socket \"$CMUX_TUI_SOCKET\""
+      ]
+    },
+    {
+      "id": "cycle-theme",
+      "name": "Cycle theme",
+      "keys": "T",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme cycle"
+      ]
+    },
+    {
+      "id": "theme_set_latte-light",
+      "name": "Theme: Latte Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set latte-light"
+      ]
+    },
+    {
+      "id": "theme_set_mocha-blue",
+      "name": "Theme: Mocha-blue",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set mocha-blue"
+      ]
+    },
+    {
+      "id": "theme_set_mocha-contrast",
+      "name": "Theme: Mocha-contrast",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set mocha-contrast"
+      ]
+    },
+    {
+      "id": "theme_set_mocha-mauve",
+      "name": "Theme: Mocha-mauve",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set mocha-mauve"
+      ]
+    },
+    {
+      "id": "theme_set_sw-ayu-dark",
+      "name": "Theme: Sw-ayu Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-ayu-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-ayu-light",
+      "name": "Theme: Sw-ayu Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-ayu-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-catppuccin-dark",
+      "name": "Theme: Sw-catppuccin Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-catppuccin-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-catppuccin-light",
+      "name": "Theme: Sw-catppuccin Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-catppuccin-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-dracula-dark",
+      "name": "Theme: Sw-dracula Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-dracula-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-dracula-light",
+      "name": "Theme: Sw-dracula Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-dracula-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-eldritch-dark",
+      "name": "Theme: Sw-eldritch Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-eldritch-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-eldritch-light",
+      "name": "Theme: Sw-eldritch Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-eldritch-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-everforest-dark",
+      "name": "Theme: Sw-everforest Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-everforest-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-everforest-light",
+      "name": "Theme: Sw-everforest Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-everforest-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-gruvbox-dark",
+      "name": "Theme: Sw-gruvbox Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-gruvbox-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-gruvbox-light",
+      "name": "Theme: Sw-gruvbox Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-gruvbox-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-kanagawa-dark",
+      "name": "Theme: Sw-kanagawa Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-kanagawa-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-kanagawa-light",
+      "name": "Theme: Sw-kanagawa Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-kanagawa-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-monokai-pro-dark",
+      "name": "Theme: Sw-monokai-pro Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-monokai-pro-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-monokai-pro-light",
+      "name": "Theme: Sw-monokai-pro Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-monokai-pro-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-noctalia-dark",
+      "name": "Theme: Sw-noctalia Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-noctalia-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-noctalia-light",
+      "name": "Theme: Sw-noctalia Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-noctalia-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-nord-dark",
+      "name": "Theme: Sw-nord Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-nord-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-nord-light",
+      "name": "Theme: Sw-nord Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-nord-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-one-dark",
+      "name": "Theme: Sw-one Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-one-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-one-light",
+      "name": "Theme: Sw-one Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-one-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-oxocarbon-dark",
+      "name": "Theme: Sw-oxocarbon Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-oxocarbon-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-oxocarbon-light",
+      "name": "Theme: Sw-oxocarbon Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-oxocarbon-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-ros-pine-dark",
+      "name": "Theme: Sw-ros-pine Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-ros-pine-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-ros-pine-light",
+      "name": "Theme: Sw-ros-pine Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-ros-pine-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-solarized-dark",
+      "name": "Theme: Sw-solarized Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-solarized-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-solarized-light",
+      "name": "Theme: Sw-solarized Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-solarized-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-synthwave-84-dark",
+      "name": "Theme: Sw-synthwave-84 Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-synthwave-84-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-synthwave-84-light",
+      "name": "Theme: Sw-synthwave-84 Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-synthwave-84-light"
+      ]
+    },
+    {
+      "id": "theme_set_sw-tokyo-night-dark",
+      "name": "Theme: Sw-tokyo-night Dark",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-tokyo-night-dark"
+      ]
+    },
+    {
+      "id": "theme_set_sw-tokyo-night-light",
+      "name": "Theme: Sw-tokyo-night Light",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set sw-tokyo-night-light"
+      ]
+    },
+    {
+      "id": "theme_set_default",
+      "name": "Theme: Default (upstream)",
+      "run": [
+        "sh",
+        "-c",
+        "cmux-theme set default"
+      ]
+    }
+  ]
+}
