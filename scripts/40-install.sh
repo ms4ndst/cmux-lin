@@ -13,6 +13,16 @@ install -m 0755 "$BIN/cmux-tui" "$DEST/cmux-tui"
 install -m 0755 "$BIN/cmux-tui-hook" "$DEST/cmux-tui-hook"
 ln -sfn "$DEST/cmux-tui" "$DEST/cmux"
 
+# Browser provider: browser tabs need one, and upstream's (cmux-browser)
+# isn't available on Linux. Built by 30-build.sh; optional at runtime (it
+# needs a Chromium-family browser, only when a browser tab exists).
+PROVIDER="$REPO_ROOT/browser-provider/target/release/cmux-browser-provider"
+if [ -x "$PROVIDER" ]; then
+  install -m 0755 "$PROVIDER" "$DEST/cmux-browser-provider"
+else
+  log "cmux-browser-provider not built (run scripts/30-build.sh); browser tabs will need another provider"
+fi
+
 CONFIG_SRC="$REPO_ROOT/assets/cmux-tui.json"
 CONFIG_DEST="${XDG_CONFIG_HOME:-$HOME/.config}/cmux/cmux-tui.json"
 if [ -f "$CONFIG_SRC" ]; then
@@ -47,4 +57,5 @@ esac
 
 log "installed:"
 ls -l "$DEST/cmux-tui" "$DEST/cmux-tui-hook" "$DEST/cmux"
+[ -x "$DEST/cmux-browser-provider" ] && ls -l "$DEST/cmux-browser-provider"
 log "cmux-tui $("$DEST/cmux-tui" --version | head -1)"

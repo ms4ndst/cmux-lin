@@ -5,8 +5,7 @@
 //!
 //! Runs until SIGINT/SIGTERM, then unregisters and closes its Chrome.
 
-#[path = "../provider.rs"]
-mod provider;
+use cmux_browser_provider as provider;
 
 fn main() {
     let mut args = std::env::args().skip(1);

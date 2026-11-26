@@ -32,6 +32,7 @@ cmux-lin/
 │   ├── 20-fetch-source.sh         # clone cmux at pin, init ghostty submodule
 │   ├── 30-build.sh               # cargo build -p cmux-tui (release)
 │   └── 40-install.sh             # install cmux-tui + `cmux` symlink to ~/.local/bin
+├── browser-provider/         # cmux-browser-provider: makes browser tabs work on Linux
 ├── gui/cmux-gtk/             # prototype native GTK4 window for a session (see its README)
 └── build/                    # (gitignored) source checkout + target/
 ```
@@ -60,6 +61,16 @@ cmux workspace create --name api
 cmux terminal list
 cmux-tui --help
 ```
+
+### Browser tabs
+
+cmux browser tabs (prefix `B` in the TUI) are pages that a *browser provider* lends to the session. Upstream's provider, cmux-browser, is a patched Chromium that isn't available on Linux, so without one, browser tabs stay at "starting". This repo builds its own, `cmux-browser-provider`, and `40-install.sh` installs it:
+
+```bash
+cmux-browser-provider --session agents   # keep running alongside the session (Ctrl-C to stop)
+```
+
+It needs a Chromium-based browser, but only when a browser tab exists: Chromium (`sudo dnf install chromium`), Brave or Edge, with Google Chrome as a last resort, or whatever `CMUX_LIN_BROWSER` names. It runs the browser headless with its own profile under `~/.local/share/cmux-lin/browsers/`, and the browser always exits with the provider. Terminals don't need it. The GTK prototype runs the same provider built in. Details are in [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md#browser-tabs).
 
 Upstream docs for everything the multiplexer can do live in `build/cmux/cmux-tui/docs/` and `build/cmux/cmux-tui/spec/` after fetching.
 

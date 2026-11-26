@@ -35,6 +35,14 @@ env -u LD_LIBRARY_PATH \
   BINDGEN_EXTRA_CLANG_ARGS="-I$GCC_INCLUDE_DIR" \
   cargo build --release -p cmux-tui
 
+# Linux browser provider (this repo's own crate; needs only the SDK from the
+# fetched source, no GTK): makes browser tabs work without cmux-browser.
+log "building cmux-browser-provider (release)"
+env -u LD_LIBRARY_PATH \
+  PATH="$HOME/.cargo/bin:$PATH" \
+  cargo build --release --manifest-path "$REPO_ROOT/browser-provider/Cargo.toml"
+
 log "binaries:"
-ls -lh "$SRC_DIR/cmux-tui/target/release/cmux-tui" "$SRC_DIR/cmux-tui/target/release/cmux-tui-hook"
+ls -lh "$SRC_DIR/cmux-tui/target/release/cmux-tui" "$SRC_DIR/cmux-tui/target/release/cmux-tui-hook" \
+  "$REPO_ROOT/browser-provider/target/release/cmux-browser-provider"
 log "build OK"

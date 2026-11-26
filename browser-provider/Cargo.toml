@@ -1,0 +1,24 @@
+[package]
+name = "cmux-browser-provider"
+version = "0.1.0"
+edition = "2024"
+description = "Linux browser provider for cmux browser tabs (runs a headless Chromium-family browser)"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "cmux_browser_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cmux-browser-provider"
+path = "src/main.rs"
+
+[dependencies]
+# Upstream's Rust SDK, from the pinned source checkout (scripts/20-fetch-source.sh).
+cmux-sdk = { path = "../build/cmux/cmux-tui/bindings/rust" }
+serde_json = "1"
+libc = "0.2"
+
+# Standalone: not part of upstream's cargo workspace.
+[workspace]

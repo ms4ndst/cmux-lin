@@ -9,7 +9,8 @@
 //!
 //! Browser tabs show the page the session's browser provider runs (a URL
 //! bar plus streamed frames, with mouse, wheel and keyboard forwarded). If no
-//! provider is registered, the app runs one itself (see `provider.rs`).
+//! provider is registered, the app runs one itself (the `browser-provider`
+//! crate at the repo root).
 //!
 //! Agent attention (blocked / finished / unread notification / working) is
 //! shown as badges on tabs and sidebar rows; notifications also go to the
@@ -27,7 +28,8 @@
 mod attention;
 mod backend;
 mod browser;
-mod provider;
+
+use cmux_browser_provider as provider;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

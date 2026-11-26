@@ -5,7 +5,6 @@ edition = "2024"
 description = "Prototype native GTK4 frontend for a cmux-tui session"
 license = "GPL-3.0-or-later"
 publish = false
-default-run = "cmux-gtk"
 
 [dependencies]
 # Upstream's Rust SDK, from the pinned source checkout (scripts/20-fetch-source.sh).
@@ -17,7 +16,8 @@ vte4 = "0.10"
 async-channel = "2"
 base64 = "0.22"
 serde_json = "1"
-libc = "0.2"
+# Built-in browser provider (also installed standalone by scripts/40-install.sh).
+cmux-browser-provider = { path = "../../browser-provider" }
 
 # Standalone: not part of upstream's cargo workspace.
 [workspace]
