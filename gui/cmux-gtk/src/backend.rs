@@ -42,6 +42,29 @@ pub struct Workspace {
     pub active: bool,
     /// Title of the active pane's active tab, for the sidebar subtitle.
     pub title: String,
+    /// Every screen, in order (a screen's position is its `select-screen`
+    /// index).
+    pub screens: Vec<Screen>,
+    /// The active screen's layout, panes and active pane (what's shown).
+    pub screen: Option<u64>,
+    pub layout: Option<Layout>,
+    pub panes: Vec<Pane>,
+    pub active_pane: Option<u64>,
+}
+
+impl Workspace {
+    /// Every tab on every screen (for attention counts).
+    pub fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.screens.iter().flat_map(|s| &s.panes).flat_map(|p| &p.tabs)
+    }
+}
+
+/// One screen of a workspace: its own split layout of panes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Screen {
+    pub id: u64,
+    pub name: Option<String>,
+    pub active: bool,
     pub layout: Option<Layout>,
     pub panes: Vec<Pane>,
     pub active_pane: Option<u64>,
@@ -533,13 +556,16 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
     let Some(list) = tree.get("workspaces").and_then(Value::as_array) else { return Vec::new() };
     list.iter()
         .map(|ws| {
-            let screen = active(ws.get("screens"), |s| s.get("active").and_then(Value::as_bool) == Some(true));
-            let panes: Vec<Pane> = screen
-                .and_then(|s| s.get("panes"))
+            let screens: Vec<Screen> = ws
+                .get("screens")
                 .and_then(Value::as_array)
-                .map(|panes| panes.iter().filter_map(parse_pane).collect())
+                .map(|screens| screens.iter().filter_map(parse_screen).collect())
                 .unwrap_or_default();
-            let active_pane = screen.and_then(|s| s.get("active_pane")).and_then(Value::as_u64);
+            let shown = screens.iter().find(|s| s.active).or_else(|| screens.first()).cloned();
+            let (screen, layout, panes, active_pane) = match shown {
+                Some(s) => (Some(s.id), s.layout, s.panes, s.active_pane),
+                None => (None, None, Vec::new(), None),
+            };
             let title = active_pane
                 .and_then(|id| panes.iter().find(|p| p.id == id))
                 .and_then(|p| p.tabs.get(p.active_tab))
@@ -550,12 +576,29 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 name: ws.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                 active: ws.get("active").and_then(Value::as_bool).unwrap_or(false),
                 title,
-                layout: screen.and_then(|s| s.get("layout")).and_then(parse_layout),
+                screens,
+                screen,
+                layout,
                 panes,
                 active_pane,
             }
         })
         .collect()
+}
+
+fn parse_screen(screen: &Value) -> Option<Screen> {
+    Some(Screen {
+        id: screen.get("id")?.as_u64()?,
+        name: screen.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).map(str::to_string),
+        active: screen.get("active").and_then(Value::as_bool).unwrap_or(false),
+        layout: screen.get("layout").and_then(parse_layout),
+        panes: screen
+            .get("panes")
+            .and_then(Value::as_array)
+            .map(|panes| panes.iter().filter_map(parse_pane).collect())
+            .unwrap_or_default(),
+        active_pane: screen.get("active_pane").and_then(Value::as_u64),
+    })
 }
 
 fn parse_pane(pane: &Value) -> Option<Pane> {
@@ -602,8 +645,3 @@ fn parse_layout(node: &Value) -> Option<Layout> {
     }
 }
 
-/// The element matching `pred`, else the first one.
-fn active(list: Option<&Value>, pred: impl Fn(&Value) -> bool) -> Option<&Value> {
-    let list = list?.as_array()?;
-    list.iter().find(|v| pred(v)).or_else(|| list.first())
-}

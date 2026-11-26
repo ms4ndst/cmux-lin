@@ -5,7 +5,9 @@ A throwaway prototype of a native GTK4 window for a cmux-tui session. It's here 
 The cmux-tui server stays in charge of everything. This window is just another client:
 
 - the sidebar lists the session's workspaces (re-read every 1.5 s, and straight after every action);
-- the selected workspace's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
+- clicking a workspace makes it the session's active workspace, so the TUI follows, and when it's switched elsewhere (in the TUI), the window follows;
+- a screen strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout): click one to switch, `×` to close it and its terminals, `+` for a new one. Each screen button shows the most urgent agent badge on that screen;
+- the active screen's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
 - every pane has a tab strip and a VTE terminal (the widget GNOME Terminal uses) for its active tab;
 - tab strip: click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down;
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
@@ -56,7 +58,7 @@ Each tab gets a mark, ranked most urgent first the same way every cmux client ra
 | `●` in the level's colour | an unread notification (error, warning, info) |
 | `◐` | an agent is working |
 
-Each sidebar row shows its workspace's most urgent mark and how many tabs need you. Colours come from the active cmux theme's notification colours.
+Each sidebar row shows its workspace's most urgent mark and how many tabs need you, across all its screens. Each screen button does the same for its own screen, so you can see which hidden screen needs you. Clicking a notification switches to the right workspace, screen and tab. Colours come from the active cmux theme's notification colours.
 
 When a tab with a finished turn or an unread notification is on screen and the window has focus, the app tells the server you've seen it (`ack-tab-notifications`), the same way the TUI does. That clears the mark everywhere, TUI included.
 
@@ -74,6 +76,8 @@ They act on the pane you're typing in:
 | `Ctrl+Shift+O` | Split down |
 | `Ctrl+Shift+B` | New browser tab |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
+| `Ctrl+Shift+N` | New screen |
+| `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
 
 ## Requirements
 
@@ -105,8 +109,7 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 
 ## Not done
 
-- multiple screens per workspace (only the active screen is shown);
-- switching workspaces on the server when you click one (the click is local);
+- renaming screens, workspaces and tabs from the window (names set elsewhere are shown);
 - zoom, pane swap, and other layout commands beyond split/close;
 
 ## Debugging

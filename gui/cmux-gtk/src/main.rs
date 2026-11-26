@@ -49,6 +49,10 @@ const APP_ID: &str = "dev.cmuxlin.CmuxGtk";
 
 const CSS: &str = "
 .pane-tabs { padding: 2px 4px; }
+.screen-strip { padding: 2px 6px; border-bottom: 1px solid alpha(currentColor, 0.15); }
+.screen-strip button { padding: 2px 8px; min-height: 0; }
+.screen-strip .tab-active { font-weight: bold; box-shadow: inset 0 -2px @accent_color; }
+.screen-strip .tab-close { padding: 0 2px; min-width: 0; }
 .pane-tabs button { padding: 2px 8px; min-height: 0; }
 .pane-tabs .tab-active { font-weight: bold; box-shadow: inset 0 -2px @accent_color; }
 .pane-tabs .tab-close { padding: 0 2px; min-width: 0; }
@@ -107,6 +111,9 @@ struct State {
     workspaces: Vec<Workspace>,
     /// Workspace currently shown, by id.
     selected: Option<u64>,
+    /// The session's active workspace in the last tree, to notice when it's
+    /// switched elsewhere (the TUI) and follow.
+    server_active: Option<u64>,
     /// Live pane views of the shown workspace, by pane id.
     panes: HashMap<u64, PaneView>,
     /// Workspace id + layout signature currently built.
@@ -155,6 +162,8 @@ impl State {
 #[derive(Clone)]
 struct Ui {
     list: gtk::ListBox,
+    /// The selected workspace's screens, above the panes.
+    screens: gtk::Box,
     content: gtk::Box,
     status: gtk::Label,
     new_ws: gtk::Button,
@@ -245,6 +254,9 @@ fn build_ui(app: &gtk::Application, session: &str) {
     status.add_css_class("dim-label");
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let screens = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    screens.add_css_class("screen-strip");
+    right.append(&screens);
     right.append(&content);
     right.append(&status);
 
@@ -256,7 +268,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     paned.set_position(220);
     window.set_child(Some(&paned));
 
-    let ui = Ui { list: list.clone(), content, status: status.clone(), new_ws: new_ws.clone() };
+    let ui = Ui { list: list.clone(), screens, content, status: status.clone(), new_ws: new_ws.clone() };
     set_live(&ui, false);
 
     // --- backend -------------------------------------------------------
@@ -272,6 +284,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         ui_tx,
         workspaces: Vec::new(),
         selected: None,
+        server_active: None,
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -312,9 +325,14 @@ fn build_ui(app: &gtk::Application, session: &str) {
         let ui = ui.clone();
         move |_, row| {
             let Some(row) = row else { return };
-            let id = state.borrow().workspaces.get(row.index() as usize).map(|w| w.id);
+            let index = row.index();
+            let id = state.borrow().workspaces.get(index as usize).map(|w| w.id);
             if id.is_some() && id != state.borrow().selected {
                 state.borrow_mut().selected = id;
+                // Make it the session's active workspace too: the TUI follows,
+                // and screen commands (which act on the active workspace)
+                // target the one shown here.
+                state.borrow().send(Ctl::request(json!({ "cmd": "select-workspace", "index": index })));
                 render(&state, &ui);
             }
         }
@@ -501,6 +519,13 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>e", |st, pane| st.send(split(pane, "right")));
     bind("<Control><Shift>o", |st, pane| st.send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.send(new_browser_tab(pane)));
+    bind("<Control><Shift>n", |st, _| {
+        if let Some(ws) = st.workspace() {
+            st.send(Ctl::request(json!({ "cmd": "new-screen", "workspace": ws.id })));
+        }
+    });
+    bind("<Control><Shift>Page_Down", |st, _| st.send(Ctl::request(json!({ "cmd": "select-screen", "delta": 1 }))));
+    bind("<Control><Shift>Page_Up", |st, _| st.send(Ctl::request(json!({ "cmd": "select-screen", "delta": -1 }))));
     bind("<Control><Shift>w", |st, pane| {
         if let Some(surface) = st.panes.get(&pane).and_then(|v| v.surface) {
             st.send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })));
@@ -560,17 +585,24 @@ fn on_disconnected(state: &Shared, ui: &Ui, reason: &str) {
 
 /// A new tree from the server: refresh the sidebar and the shown workspace.
 fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
-    let selected = state.borrow().selected;
-    // Keep the current choice if it still exists; otherwise follow the
-    // server's active workspace.
+    let (selected, previous_active) = {
+        let st = state.borrow();
+        (st.selected, st.server_active)
+    };
+    let active = workspaces.iter().find(|w| w.active).map(|w| w.id);
+    // Follow the session when its active workspace changed (switched in the
+    // TUI, or our own click taking effect); otherwise keep the current
+    // choice, so a poll racing a click doesn't snap back.
+    let wanted = if active != previous_active { active.or(selected) } else { selected };
     let target = workspaces
         .iter()
-        .position(|w| Some(w.id) == selected)
+        .position(|w| Some(w.id) == wanted)
         .or_else(|| workspaces.iter().position(|w| w.active))
         .or(if workspaces.is_empty() { None } else { Some(0) });
     {
         let mut st = state.borrow_mut();
         st.selected = target.map(|i| workspaces[i].id);
+        st.server_active = active;
         st.workspaces = workspaces.clone();
     }
 
@@ -587,6 +619,73 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
         ui.list.select_row(Some(&row));
     }
     render(state, ui);
+}
+
+/// The screen strip: one button per screen (number, name, attention badge),
+/// `×` to close one, `+` for a new one. Selecting goes through the server so
+/// the TUI shows the same screen.
+fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
+    while let Some(child) = ui.screens.first_child() {
+        ui.screens.remove(&child);
+    }
+    let Some(ws) = ws else {
+        ui.screens.set_visible(false);
+        return;
+    };
+    ui.screens.set_visible(true);
+    let (ctl, agents) = {
+        let st = state.borrow();
+        (st.ctl.clone(), st.agents.clone())
+    };
+    let send = move |request: Value| {
+        let _ = ctl.send(Ctl::request(request));
+    };
+    for (index, screen) in ws.screens.iter().enumerate() {
+        let label = match &screen.name {
+            Some(name) => format!("{} {name}", index + 1),
+            None => format!("Screen {}", index + 1),
+        };
+        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let marks: Vec<Attn> =
+            screen.panes.iter().flat_map(|p| &p.tabs).filter_map(|t| attention::of_tab(t, &agents)).collect();
+        if let Some(top) = marks.iter().copied().max() {
+            inner.append(&attention::badge(top, marks.iter().filter(|a| a.needs_you()).count()));
+        }
+        inner.append(&gtk::Label::new(Some(&label)));
+        let button = gtk::Button::new();
+        button.set_child(Some(&inner));
+        button.add_css_class("flat");
+        button.set_focus_on_click(false);
+        if Some(screen.id) == ws.screen {
+            button.add_css_class("tab-active");
+        }
+        button.set_tooltip_text(Some("Switch screen (Ctrl+Shift+PageDown/PageUp)"));
+        button.connect_clicked({
+            let send = send.clone();
+            move |_| send(json!({ "cmd": "select-screen", "index": index }))
+        });
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.add_css_class("tab-close");
+        close.set_focus_on_click(false);
+        close.set_tooltip_text(Some("Close screen (and the terminals on it)"));
+        let screen_id = screen.id;
+        close.connect_clicked({
+            let send = send.clone();
+            move |_| send(json!({ "cmd": "close-screen", "screen": screen_id }))
+        });
+        let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        group.append(&button);
+        group.append(&close);
+        ui.screens.append(&group);
+    }
+    let add = gtk::Button::with_label("+");
+    add.add_css_class("flat");
+    add.set_focus_on_click(false);
+    add.set_tooltip_text(Some("New screen (Ctrl+Shift+N)"));
+    let workspace = ws.id;
+    add.connect_clicked(move |_| send(json!({ "cmd": "new-screen", "workspace": workspace })));
+    ui.screens.append(&add);
 }
 
 fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
@@ -608,7 +707,7 @@ fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
 
     // The workspace's most urgent state, and how many tabs need you.
     let states: Vec<Attn> =
-        ws.panes.iter().flat_map(|p| &p.tabs).filter_map(|t| attention::of_tab(t, agents)).collect();
+        ws.all_tabs().filter_map(|t| attention::of_tab(t, agents)).collect();
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.append(&column);
     if let Some(top) = states.iter().copied().max() {
@@ -627,16 +726,18 @@ fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
 fn render(state: &Shared, ui: &Ui) {
     let Some(ws) = state.borrow().workspace().cloned() else {
         clear_content(state, ui);
+        draw_screens(state, ui, None);
         ui.status.set_text("Session has no workspaces");
         return;
     };
+    draw_screens(state, ui, Some(&ws));
     let Some(layout) = ws.layout.clone() else {
         clear_content(state, ui);
         ui.status.set_text("This workspace has no panes");
         return;
     };
 
-    let signature = format!("{}:{}", ws.id, layout.signature());
+    let signature = format!("{}:{}:{}", ws.id, ws.screen.unwrap_or(0), layout.signature());
     let rebuilt = state.borrow().built.as_deref() != Some(&signature);
     if rebuilt {
         rebuild(state, ui, &layout);
@@ -669,7 +770,11 @@ fn render(state: &Shared, ui: &Ui) {
         ack_seen(state);
         return;
     }
-    let name = if ws.name.is_empty() { format!("workspace {}", ws.id) } else { ws.name.clone() };
+    let mut name = if ws.name.is_empty() { format!("workspace {}", ws.id) } else { ws.name.clone() };
+    if ws.screens.len() > 1 {
+        let index = ws.screens.iter().position(|s| Some(s.id) == ws.screen).unwrap_or(0);
+        name = format!("{name} · screen {} of {}", index + 1, ws.screens.len());
+    }
     let panes = ws.panes.len();
     let tabs: usize = ws.panes.iter().map(|p| p.tabs.len()).sum();
     ui.status.set_text(&format!(
@@ -1175,17 +1280,24 @@ fn on_notification(state: &Shared, ui: &Ui, id: u64, title: &str, body: &str, le
 /// Jump to the tab showing `surface`: select its workspace here, make it the
 /// active tab and pane on the server, and raise the window.
 fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
-    let found = state.borrow().workspaces.iter().find_map(|ws| {
-        ws.panes.iter().find_map(|pane| {
-            let index = pane.tabs.iter().position(|t| t.surface == surface)?;
-            Some((ws.id, pane.id, index))
+    // Find it on any screen of any workspace: (workspace index and id,
+    // screen index, pane, tab index).
+    let found = state.borrow().workspaces.iter().enumerate().find_map(|(ws_index, ws)| {
+        ws.screens.iter().enumerate().find_map(|(screen_index, screen)| {
+            screen.panes.iter().find_map(|pane| {
+                let index = pane.tabs.iter().position(|t| t.surface == surface)?;
+                Some((ws_index, ws.id, screen_index, pane.id, index))
+            })
         })
     });
-    let Some((ws_id, pane_id, index)) = found else { return };
+    let Some((ws_index, ws_id, screen_index, pane_id, index)) = found else { return };
     {
         let mut st = state.borrow_mut();
         st.selected = Some(ws_id);
         st.focused = Some(pane_id);
+        // Screen selection acts on the active workspace, so select that first.
+        st.send(Ctl::request(json!({ "cmd": "select-workspace", "index": ws_index })));
+        st.send(Ctl::request(json!({ "cmd": "select-screen", "index": screen_index })));
         st.send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane_id, "index": index })));
         st.send(Ctl::request(json!({ "cmd": "focus-pane", "pane": pane_id })));
     }
