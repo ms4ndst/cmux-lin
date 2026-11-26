@@ -351,6 +351,17 @@ fn build_ui(app: &gtk::Application, session: &str) {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
                     UiMsg::Copied { generation, result, cut } => on_copied(&state, &ui, generation, result, cut),
+                    UiMsg::ContextMenu { generation, x, y, link } => {
+                        let show = state
+                            .borrow()
+                            .panes
+                            .values()
+                            .find(|v| v.generation == generation)
+                            .map(|v| v.web.menu_shower());
+                        if let Some(show) = show {
+                            show(x, y, link); // after the borrow ends
+                        }
+                    }
                     UiMsg::BrowserProblem(problem) => {
                         if let Some(problem) = &problem {
                             ui.status.set_text(problem);
@@ -412,6 +423,23 @@ fn build_ui(app: &gtk::Application, session: &str) {
 
     // Copy / paste in the focused browser tab, also reachable as actions
     // (menus, D-Bus): `app.browser-copy`, `app.browser-paste`.
+    let open_menu = gio::SimpleAction::new("browser-menu", None);
+    open_menu.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            // Resolve the view, release the borrow, then open (it calls back
+            // into the state).
+            let picture = {
+                let st = state.borrow();
+                st.target_pane().and_then(|id| st.panes.get(&id)).filter(|v| v.browser).map(|v| v.web.opener())
+            };
+            if let Some(open) = picture {
+                open();
+            }
+        }
+    });
+    app.add_action(&open_menu);
+
     for (name, paste) in [("browser-copy", false), ("browser-paste", true)] {
         let action = gio::SimpleAction::new(name, None);
         action.connect_activate({
@@ -830,25 +858,39 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
             }
         }
     });
-    // Copy/cut: read the page's selection off the UI thread (it's a
-    // DevTools round trip), then put it on the clipboard in `on_copied`.
-    let clip: browser::Clip = Rc::new({
+    // Requests the browser view can't do alone. Copy and the context menu's
+    // link lookup are DevTools round trips, so they run off the UI thread
+    // and report back through the UI channel.
+    let host: browser::Host = Rc::new({
         let state = state.clone();
-        move |cut| {
+        move |request| {
             let st = state.borrow();
             let Some(view) = st.panes.get(&id) else { return };
-            if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
-                eprintln!("cmux-gtk: copy pane {id} tab {:?}", view.browser_tab);
-            }
-            let Some(tab_id) = view.browser_tab.clone() else { return };
             let (socket, ui_tx, generation) = (st.socket_path.clone(), st.ui_tx.clone(), view.generation);
-            std::thread::spawn(move || {
-                let result = provider::selected_text(&socket, &tab_id);
-                let _ = ui_tx.send_blocking(UiMsg::Copied { generation, result, cut });
-            });
+            let tab_id = view.browser_tab.clone();
+            match request {
+                browser::HostRequest::Copy { cut } => {
+                    let Some(tab_id) = tab_id else { return };
+                    std::thread::spawn(move || {
+                        let result = provider::selected_text(&socket, &tab_id);
+                        let _ = ui_tx.send_blocking(UiMsg::Copied { generation, result, cut });
+                    });
+                }
+                browser::HostRequest::OpenInNewTab(url) => {
+                    st.send(Ctl::request(json!({ "cmd": "new-browser-tab", "pane": id, "url": url })));
+                }
+                browser::HostRequest::ContextMenu { x, y, page_x, page_y } => {
+                    std::thread::spawn(move || {
+                        // A failed lookup still shows the menu, just without
+                        // the link items.
+                        let link = tab_id.and_then(|tab| provider::link_at(&socket, &tab, page_x, page_y).ok().flatten());
+                        let _ = ui_tx.send_blocking(UiMsg::ContextMenu { generation, x, y, link });
+                    });
+                }
+            }
         }
     });
-    let web = browser::WebView::new(send, clip);
+    let web = browser::WebView::new(send, host);
     let web_focus = gtk::EventControllerFocus::new();
     web_focus.connect_enter({
         let state = state.clone();

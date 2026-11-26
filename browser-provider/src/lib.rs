@@ -492,6 +492,17 @@ pub fn selected_text(socket_path: &Path, tab_id: &str) -> Result<String, String>
     Ok(value.as_str().unwrap_or("").to_string())
 }
 
+/// The link (absolute URL) under page point (`x`, `y`) in CSS pixels in
+/// browser tab `tab_id`, if there is one.
+pub fn link_at(socket_path: &Path, tab_id: &str, x: f64, y: f64) -> Result<Option<String>, String> {
+    let expression = format!(
+        "(() => {{ const e = document.elementFromPoint({x}, {y}); \
+         const a = e && e.closest('a[href]'); return a ? a.href : null; }})()"
+    );
+    let value = evaluate(socket_path, tab_id, &expression)?;
+    Ok(value.as_str().filter(|href| !href.is_empty()).map(str::to_string))
+}
+
 /// Evaluate `expression` in the page of browser tab `tab_id` and return its
 /// value (by value, JSON).
 fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Value, String> {

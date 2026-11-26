@@ -3,9 +3,14 @@
 //! provider, so agents and the TUI see the same page).
 //!
 //! Copy and cut read the page's selection (the host does that over DevTools,
-//! via `clip`) and put it on the desktop clipboard; paste types the desktop
+//! via `host`) and put it on the desktop clipboard; paste types the desktop
 //! clipboard into the page. Selecting itself happens in the page: drag,
 //! double/triple click, Shift+arrows, Ctrl+A.
+//!
+//! Right-click opens a native menu (navigation, clipboard, and for a link:
+//! open in new tab / copy address); Shift+right-click goes to the page, for
+//! sites with their own context menus. The headless page shows no menu of
+//! its own.
 //!
 //! Input is forwarded as protocol browser commands through `send`. Pointer
 //! input must quote the guard token of the frame it was aimed at
@@ -17,7 +22,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 use serde_json::{Value, json};
 
 use crate::backend::Frame;
@@ -25,9 +30,19 @@ use crate::backend::Frame;
 /// Sends one browser command (`cmd`, fields) for this pane's tab.
 pub type Send = Rc<dyn Fn(&str, Value)>;
 
-/// Asks the host to copy the tab's selection to the clipboard; `true` cuts
-/// (deletes the selection afterwards).
-pub type Clip = Rc<dyn Fn(bool)>;
+/// What the view asks of its host (things that need the session or a
+/// DevTools round trip).
+pub enum HostRequest {
+    /// Copy the tab's selection to the clipboard; `cut` deletes it after.
+    Copy { cut: bool },
+    /// Open `url` in a new browser tab next to this one.
+    OpenInNewTab(String),
+    /// Find the link at page point (`page_x`, `page_y`), then call
+    /// [`WebView::show_menu`] at widget point (`x`, `y`).
+    ContextMenu { x: f64, y: f64, page_x: f64, page_y: f64 },
+}
+
+pub type Host = Rc<dyn Fn(HostRequest)>;
 
 pub struct WebView {
     pub root: gtk::Box,
@@ -42,12 +57,18 @@ pub struct WebView {
     pointer_seq: Rc<Cell<Option<u64>>>,
     /// Mouse button held down, so drags select (moves carry the button).
     held: Rc<Cell<Option<&'static str>>>,
-    clip: Clip,
+    host: Host,
     send: Send,
+    /// The right-click menu, created once and re-filled per use.
+    menu: gtk::PopoverMenu,
+    /// The page's current URL (for "Open page in default browser").
+    url: Rc<std::cell::RefCell<String>>,
+    /// Last pointer position over the page (widget coordinates).
+    pointer: Rc<Cell<Option<(f64, f64)>>>,
 }
 
 impl WebView {
-    pub fn new(send: Send, clip: Clip) -> Self {
+    pub fn new(send: Send, host: Host) -> Self {
         let back = gtk::Button::from_icon_name("go-previous-symbolic");
         back.set_tooltip_text(Some("Back"));
         let forward = gtk::Button::from_icon_name("go-next-symbolic");
@@ -113,9 +134,16 @@ impl WebView {
             frame: Rc::new(Cell::new((0.0, 0.0))),
             pointer_seq: Rc::new(Cell::new(None)),
             held: Rc::new(Cell::new(None)),
-            clip: clip.clone(),
+            host: host.clone(),
             send: send.clone(),
+            menu: gtk::PopoverMenu::from_model(None::<&gio::MenuModel>),
+            url: Rc::new(std::cell::RefCell::new(String::new())),
+            pointer: Rc::new(Cell::new(None)),
         };
+        view.menu.set_parent(&view.picture);
+        view.menu.set_has_arrow(false);
+        view.menu.set_halign(gtk::Align::Start);
+        view.install_menu_actions();
 
         for (button, cmd) in [(&back, "browser-back"), (&forward, "browser-forward"), (&reload, "browser-reload")] {
             let send = send.clone();
@@ -133,13 +161,16 @@ impl WebView {
             }
         });
         view.wire_pointer(&send);
-        view.wire_keys(&send, clip);
+        view.wire_keys(&send, host);
         view
     }
 
     /// Show the tab's state (URL, loading status, errors). `problem` is why
     /// the built-in provider can't start a browser, if it can't.
     pub fn show_state(&self, url: &str, status: &str, error: Option<&str>, problem: Option<&str>) {
+        if !url.is_empty() {
+            *self.url.borrow_mut() = url.to_string();
+        }
         if !self.entry.has_focus() && self.entry.text() != url {
             self.entry.set_text(url);
         }
@@ -205,9 +236,76 @@ impl WebView {
 
     /// Copy and paste entry points for menus and actions:
     /// (copy/cut, paste).
-    pub fn clip_handle(&self) -> (Clip, Rc<dyn Fn()>) {
+    pub fn clip_handle(&self) -> (Rc<dyn Fn(bool)>, Rc<dyn Fn()>) {
+        let (picture, send, host) = (self.picture.clone(), self.send.clone(), self.host.clone());
+        (Rc::new(move |cut| host(HostRequest::Copy { cut })), Rc::new(move || paste(&picture, &send)))
+    }
+
+    /// Actions behind the right-click menu, as the `web.` group on the page.
+    fn install_menu_actions(&self) {
+        let group = gio::SimpleActionGroup::new();
+        let add = |name: &str, parameter: Option<&glib::VariantTy>, run: Box<dyn Fn(Option<String>)>| {
+            let action = gio::SimpleAction::new(name, parameter);
+            action.connect_activate(move |_, value| run(value.and_then(|v| v.get::<String>())));
+            group.add_action(&action);
+        };
+        for (name, cmd) in [("back", "browser-back"), ("forward", "browser-forward"), ("reload", "browser-reload")] {
+            let send = self.send.clone();
+            add(name, None, Box::new(move |_| send(cmd, json!({}))));
+        }
+        let host = self.host.clone();
+        add("copy", None, Box::new(move |_| host(HostRequest::Copy { cut: false })));
         let (picture, send) = (self.picture.clone(), self.send.clone());
-        (self.clip.clone(), Rc::new(move || paste(&picture, &send)))
+        add("paste", None, Box::new(move |_| paste(&picture, &send)));
+        let send = self.send.clone();
+        add("select-all", None, Box::new(move |_| {
+            send("browser-key-press", json!({
+                "key": "a", "code": "KeyA", "modifiers": 2, "windows_virtual_key_code": 65,
+            }));
+        }));
+        let host = self.host.clone();
+        add("open-link", Some(glib::VariantTy::STRING), Box::new(move |url| {
+            if let Some(url) = url {
+                host(HostRequest::OpenInNewTab(url));
+            }
+        }));
+        let picture = self.picture.clone();
+        add("copy-link", Some(glib::VariantTy::STRING), Box::new(move |url| {
+            if let Some(url) = url {
+                picture.clipboard().set_text(&url);
+            }
+        }));
+        let current = self.url.clone();
+        add("open-external", None, Box::new(move |_| {
+            let url = current.borrow().clone();
+            if url.starts_with("http://") || url.starts_with("https://") {
+                let _ = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
+            }
+        }));
+        self.picture.insert_action_group("web", Some(&group));
+    }
+
+    /// Opens the context menu without a click (Menu key, Shift+F10, or the
+    /// `app.browser-menu` action): at the last pointer position, else the
+    /// centre of the page. Call it after releasing any borrow of the view.
+    pub fn opener(&self) -> impl Fn() + 'static {
+        let (picture, frame, pointer, host) =
+            (self.picture.clone(), self.frame.clone(), self.pointer.clone(), self.host.clone());
+        move || {
+            let (w, h) = (f64::from(picture.width()), f64::from(picture.height()));
+            let (x, y) = pointer.get().unwrap_or((w / 2.0, h / 2.0));
+            if let Some((page_x, page_y)) = map_to_page(&picture, frame.get(), x, y) {
+                host(HostRequest::ContextMenu { x, y, page_x, page_y });
+            }
+        }
+    }
+
+    /// A handle that shows the right-click menu, usable after the caller has
+    /// released any borrow of the view (popping up moves focus, which runs
+    /// focus handlers).
+    pub fn menu_shower(&self) -> impl Fn(f64, f64, Option<String>) + 'static {
+        let menu = self.menu.clone();
+        move |x, y, link| show_menu(&menu, x, y, link)
     }
 
     /// The widget that takes keyboard focus for this view.
@@ -220,18 +318,7 @@ impl WebView {
         let to_page = {
             let picture = self.picture.clone();
             let frame = self.frame.clone();
-            move |x: f64, y: f64| -> Option<(f64, f64)> {
-                let (fw, fh) = frame.get();
-                let (w, h) = (f64::from(picture.width()), f64::from(picture.height()));
-                if fw <= 0.0 || fh <= 0.0 || w <= 0.0 || h <= 0.0 {
-                    return None;
-                }
-                // ScaleDown: never enlarged, centred in the widget.
-                let scale = (w / fw).min(h / fh).min(1.0);
-                let (ox, oy) = ((w - fw * scale) / 2.0, (h - fh * scale) / 2.0);
-                let (px, py) = ((x - ox) / scale, (y - oy) / scale);
-                (px >= 0.0 && py >= 0.0 && px <= fw && py <= fh).then_some((px, py))
-            }
+            move |x: f64, y: f64| map_to_page(&picture, frame.get(), x, y)
         };
 
         let click = gtk::GestureClick::new();
@@ -243,12 +330,26 @@ impl WebView {
                 _ => "left",
             }
         }
+        fn shift_held(gesture: &gtk::GestureClick) -> bool {
+            gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK)
+        }
         click.connect_pressed({
-            let (send, to_page, seq, picture, held) =
-                (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.picture.clone(), self.held.clone());
+            let (send, to_page, seq, picture, held, host) = (
+                send.clone(),
+                to_page.clone(),
+                self.pointer_seq.clone(),
+                self.picture.clone(),
+                self.held.clone(),
+                self.host.clone(),
+            );
             move |gesture, presses, x, y| {
                 picture.grab_focus();
                 let (Some((px, py)), Some(frame_seq)) = (to_page(x, y), seq.get()) else { return };
+                // Right-click opens our menu; Shift+right-click goes to the page.
+                if gesture.current_button() == 3 && !shift_held(gesture) {
+                    host(HostRequest::ContextMenu { x, y, page_x: px, page_y: py });
+                    return;
+                }
                 held.set(Some(button_name(gesture.current_button())));
                 send("browser-mouse-guarded", json!({
                     "kind": "down", "button": button_name(gesture.current_button()),
@@ -261,6 +362,9 @@ impl WebView {
                 (send.clone(), to_page.clone(), self.pointer_seq.clone(), self.held.clone());
             move |gesture, presses, x, y| {
                 held.set(None);
+                if gesture.current_button() == 3 && !shift_held(gesture) {
+                    return; // the press opened our menu
+                }
                 let (Some((px, py)), Some(frame_seq)) = (to_page(x, y), seq.get()) else { return };
                 send("browser-mouse-guarded", json!({
                     "kind": "up", "button": button_name(gesture.current_button()),
@@ -296,8 +400,11 @@ impl WebView {
         let pointer = Rc::new(Cell::new((0.0, 0.0)));
         let track = gtk::EventControllerMotion::new();
         track.connect_motion({
-            let pointer = pointer.clone();
-            move |_, x, y| pointer.set((x, y))
+            let (pointer, last_pointer) = (pointer.clone(), self.pointer.clone());
+            move |_, x, y| {
+                pointer.set((x, y));
+                last_pointer.set(Some((x, y)));
+            }
         });
         self.picture.add_controller(track);
         scroll.connect_scroll({
@@ -318,10 +425,11 @@ impl WebView {
 
     /// Keyboard: text goes in as inserted text, editing and navigation keys
     /// (and Ctrl/Alt chords) as key presses.
-    fn wire_keys(&self, send: &Send, clip: Clip) {
+    fn wire_keys(&self, send: &Send, host: Host) {
         let keys = gtk::EventControllerKey::new();
         let send = send.clone();
         let picture = self.picture.clone();
+        let open_menu = self.opener();
         keys.connect_key_pressed(move |_, key, _, state| {
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -330,15 +438,19 @@ impl WebView {
             // Ctrl+Shift+V / Shift+Insert paste. The page's own clipboard is
             // the headless browser's, so these go through the desktop's.
             if ctrl && lower == gdk::Key::c {
-                clip(false);
+                host(HostRequest::Copy { cut: false });
                 return glib::Propagation::Stop;
             }
             if ctrl && !shift && lower == gdk::Key::x {
-                clip(true);
+                host(HostRequest::Copy { cut: true });
                 return glib::Propagation::Stop;
             }
             if (ctrl && lower == gdk::Key::v) || (shift && key == gdk::Key::Insert) {
                 paste(&picture, &send);
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::Menu || (shift && key == gdk::Key::F10) {
+                open_menu();
                 return glib::Propagation::Stop;
             }
             let mut modifiers = 0u32;
@@ -382,6 +494,20 @@ impl WebView {
         });
         self.picture.add_controller(keys);
     }
+}
+
+/// Widget point → page pixel for a frame of size `frame` shown ScaleDown
+/// (never enlarged, centred). `None` outside the page.
+fn map_to_page(picture: &gtk::Picture, frame: (f64, f64), x: f64, y: f64) -> Option<(f64, f64)> {
+    let (fw, fh) = frame;
+    let (w, h) = (f64::from(picture.width()), f64::from(picture.height()));
+    if fw <= 0.0 || fh <= 0.0 || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let scale = (w / fw).min(h / fh).min(1.0);
+    let (ox, oy) = ((w - fw * scale) / 2.0, (h - fh * scale) / 2.0);
+    let (px, py) = ((x - ox) / scale, (y - oy) / scale);
+    (px >= 0.0 && py >= 0.0 && px <= fw && py <= fh).then_some((px, py))
 }
 
 /// Type the desktop clipboard's text into the page.
@@ -431,4 +557,47 @@ fn normalize_url(input: &str) -> String {
     } else {
         format!("https://{input}")
     }
+}
+
+impl Drop for WebView {
+    fn drop(&mut self) {
+        // A popover must be detached before its parent widget goes away.
+        self.menu.unparent();
+    }
+}
+
+/// Fill and pop up the right-click menu at widget point (`x`, `y`); `link`
+/// adds the link items.
+fn show_menu(menu: &gtk::PopoverMenu, x: f64, y: f64, link: Option<String>) {
+    let model = gio::Menu::new();
+    if let Some(link) = link {
+        let section = gio::Menu::new();
+        let open = gio::MenuItem::new(Some("Open link in new tab"), None);
+        open.set_action_and_target_value(Some("web.open-link"), Some(&link.to_variant()));
+        section.append_item(&open);
+        let copy = gio::MenuItem::new(Some("Copy link address"), None);
+        copy.set_action_and_target_value(Some("web.copy-link"), Some(&link.to_variant()));
+        section.append_item(&copy);
+        model.append_section(None, &section);
+    }
+    let navigation = gio::Menu::new();
+    navigation.append(Some("Back"), Some("web.back"));
+    navigation.append(Some("Forward"), Some("web.forward"));
+    navigation.append(Some("Reload"), Some("web.reload"));
+    model.append_section(None, &navigation);
+    let edit = gio::Menu::new();
+    edit.append(Some("Copy"), Some("web.copy"));
+    edit.append(Some("Paste"), Some("web.paste"));
+    edit.append(Some("Select all"), Some("web.select-all"));
+    model.append_section(None, &edit);
+    let page = gio::Menu::new();
+    page.append(Some("Open page in default browser"), Some("web.open-external"));
+    model.append_section(None, &page);
+
+    if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+        eprintln!("cmux-gtk: context menu at ({x:.0}, {y:.0}), {} sections", model.n_items());
+    }
+    menu.set_menu_model(Some(&model));
+    menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    menu.popup();
 }
