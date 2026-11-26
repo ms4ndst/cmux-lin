@@ -32,7 +32,7 @@ mod browser;
 use cmux_browser_provider as provider;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -111,9 +111,19 @@ struct State {
     workspaces: Vec<Workspace>,
     /// Workspace currently shown, by id.
     selected: Option<u64>,
-    /// The session's active workspace in the last tree, to notice when it's
-    /// switched elsewhere (the TUI) and follow.
-    server_active: Option<u64>,
+    /// This window's own screen per workspace and tab per pane. Selection is
+    /// client-local, as in upstream's design (the TUI keeps its own too); the
+    /// tree's active flags are only shared defaults, used for first display
+    /// and for things just created.
+    screen_choice: HashMap<u64, u64>,
+    tab_choice: HashMap<u64, u64>,
+    /// Ids seen so far, to recognise newly created workspaces, screens, tabs.
+    known: Option<(HashSet<u64>, HashSet<u64>, HashSet<u64>)>,
+    /// The tree as the server sent it; `workspaces` is it with the choices
+    /// above applied.
+    raw: Vec<Workspace>,
+    /// Widgets, for handlers that change the selection and redraw.
+    ui: Option<Ui>,
     /// Live pane views of the shown workspace, by pane id.
     panes: HashMap<u64, PaneView>,
     /// Workspace id + layout signature currently built.
@@ -288,7 +298,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
         ui_tx,
         workspaces: Vec::new(),
         selected: None,
-        server_active: None,
+        screen_choice: HashMap::new(),
+        tab_choice: HashMap::new(),
+        known: None,
+        raw: Vec::new(),
+        ui: None,
         panes: HashMap::new(),
         built: None,
         focused: None,
@@ -302,6 +316,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         provider: None,
         browser_problem: None,
     }));
+    state.borrow_mut().ui = Some(ui.clone());
 
     // Browser tabs need a browser provider; run one unless disabled. It
     // stays idle when another provider (cmux-browser or a standalone
@@ -332,11 +347,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
             let index = row.index();
             let id = state.borrow().workspaces.get(index as usize).map(|w| w.id);
             if id.is_some() && id != state.borrow().selected {
+                // Client-local: other windows and the TUI keep their own.
                 state.borrow_mut().selected = id;
-                // Make it the session's active workspace too: the TUI follows,
-                // and screen commands (which act on the active workspace)
-                // target the one shown here.
-                state.borrow().send(Ctl::request(json!({ "cmd": "select-workspace", "index": index })));
                 render(&state, &ui);
             }
         }
@@ -541,43 +553,41 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     let controller = gtk::ShortcutController::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.set_scope(gtk::ShortcutScope::Global);
-    let bind = |accel: &str, action: fn(&State, u64)| {
+    let bind = |accel: &str, action: fn(&Shared, u64)| {
         let state = state.clone();
         let callback = gtk::CallbackAction::new(move |_, _| {
-            let st = state.borrow();
-            if let Some(pane) = st.target_pane() {
-                action(&st, pane);
+            let pane = state.borrow().target_pane();
+            if let Some(pane) = pane {
+                action(&state, pane);
             }
             glib::Propagation::Stop
         });
         controller.add_shortcut(gtk::Shortcut::new(gtk::ShortcutTrigger::parse_string(accel), Some(callback)));
     };
-    bind("<Control><Shift>t", |st, pane| st.send(new_tab(pane)));
-    bind("<Control><Shift>e", |st, pane| st.send(split(pane, "right")));
-    bind("<Control><Shift>o", |st, pane| st.send(split(pane, "down")));
-    bind("<Control><Shift>b", |st, pane| st.send(new_browser_tab(pane)));
-    bind("<Control><Shift>u", |st, pane| st.send(Ctl::Undo { pane, confirm: None }));
+    bind("<Control><Shift>t", |st, pane| st.borrow().send(new_tab(pane)));
+    bind("<Control><Shift>e", |st, pane| st.borrow().send(split(pane, "right")));
+    bind("<Control><Shift>o", |st, pane| st.borrow().send(split(pane, "down")));
+    bind("<Control><Shift>b", |st, pane| st.borrow().send(new_browser_tab(pane)));
+    bind("<Control><Shift>u", |st, pane| st.borrow().send(Ctl::Undo { pane, confirm: None }));
     bind("<Control><Shift>z", |st, pane| {
-        st.send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })));
+        st.borrow().send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })));
     });
     bind("<Control><Shift>n", |st, _| {
+        let st = st.borrow();
         if let Some(ws) = st.workspace() {
             st.send(Ctl::request(json!({ "cmd": "new-screen", "workspace": ws.id })));
         }
     });
-    bind("<Control><Shift>Page_Down", |st, _| st.send(Ctl::request(json!({ "cmd": "select-screen", "delta": 1 }))));
-    bind("<Control><Shift>Page_Up", |st, _| st.send(Ctl::request(json!({ "cmd": "select-screen", "delta": -1 }))));
+    bind("<Control><Shift>Page_Down", |st, _| step_screen(st, 1));
+    bind("<Control><Shift>Page_Up", |st, _| step_screen(st, -1));
     bind("<Control><Shift>w", |st, pane| {
+        let st = st.borrow();
         if let Some(surface) = st.panes.get(&pane).and_then(|v| v.surface) {
             st.send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })));
         }
     });
-    bind("<Control>Page_Down", |st, pane| {
-        st.send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane, "delta": 1 })));
-    });
-    bind("<Control>Page_Up", |st, pane| {
-        st.send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane, "delta": -1 })));
-    });
+    bind("<Control>Page_Down", |st, pane| step_tab(st, pane, 1));
+    bind("<Control>Page_Up", |st, pane| step_tab(st, pane, -1));
     window.add_controller(controller);
 }
 
@@ -626,26 +636,53 @@ fn on_disconnected(state: &Shared, ui: &Ui, reason: &str) {
 
 /// A new tree from the server: refresh the sidebar and the shown workspace.
 fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
-    let (selected, previous_active) = {
-        let st = state.borrow();
-        (st.selected, st.server_active)
-    };
-    let active = workspaces.iter().find(|w| w.active).map(|w| w.id);
-    // Follow the session when its active workspace changed (switched in the
-    // TUI, or our own click taking effect); otherwise keep the current
-    // choice, so a poll racing a click doesn't snap back.
-    let wanted = if active != previous_active { active.or(selected) } else { selected };
-    let target = workspaces
-        .iter()
-        .position(|w| Some(w.id) == wanted)
-        .or_else(|| workspaces.iter().position(|w| w.active))
-        .or(if workspaces.is_empty() { None } else { Some(0) });
-    {
+    // Follow the shared defaults only for things that are new since the last
+    // tree (created here or elsewhere and made active by the server: a new
+    // workspace, screen or tab); otherwise keep this window's own choices.
+    let target = {
         let mut st = state.borrow_mut();
+        let first = st.known.is_none();
+        let (old_ws, old_screens, old_tabs) = st.known.take().unwrap_or_default();
+        let mut wanted = st.selected;
+        for ws in &workspaces {
+            if (first && ws.active && wanted.is_none()) || (!first && ws.active && !old_ws.contains(&ws.id)) {
+                wanted = Some(ws.id);
+            }
+            for screen in &ws.screens {
+                if !first && screen.active && !old_screens.contains(&screen.id) {
+                    st.screen_choice.insert(ws.id, screen.id);
+                }
+                for pane in &screen.panes {
+                    if let Some(tab) = pane.active() {
+                        if !first && !old_tabs.contains(&tab.surface) {
+                            st.tab_choice.insert(pane.id, tab.surface);
+                        }
+                    }
+                }
+            }
+        }
+        st.known = Some((
+            workspaces.iter().map(|w| w.id).collect(),
+            workspaces.iter().flat_map(|w| &w.screens).map(|s| s.id).collect(),
+            workspaces.iter().flat_map(|w| w.all_tabs()).map(|t| t.surface).collect(),
+        ));
+        // Forget choices for things that are gone.
+        let screens: HashSet<u64> = workspaces.iter().flat_map(|w| &w.screens).map(|s| s.id).collect();
+        st.screen_choice.retain(|_, screen| screens.contains(screen));
+        let tabs: HashSet<u64> = workspaces.iter().flat_map(|w| w.all_tabs()).map(|t| t.surface).collect();
+        st.tab_choice.retain(|_, surface| tabs.contains(surface));
+
+        let target = workspaces
+            .iter()
+            .position(|w| Some(w.id) == wanted)
+            .or_else(|| workspaces.iter().position(|w| w.active))
+            .or(if workspaces.is_empty() { None } else { Some(0) });
         st.selected = target.map(|i| workspaces[i].id);
-        st.server_active = active;
-        st.workspaces = workspaces.clone();
-    }
+        st.raw = workspaces;
+        st.workspaces = apply_choices(&st.raw, &st.screen_choice, &st.tab_choice);
+        target
+    };
+    let workspaces = state.borrow().workspaces.clone();
 
     // Rebuild the sidebar rows. Selecting a row fires `row-selected`, whose
     // handler sees `selected` already set and does nothing.
@@ -661,6 +698,94 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
         ui.list.select_row(Some(&row));
     }
     render(state, ui);
+}
+
+/// The server tree with this window's own screen and tab choices applied:
+/// each workspace shows its chosen screen (else the shared active one) and
+/// each pane its chosen tab.
+fn apply_choices(raw: &[Workspace], screens: &HashMap<u64, u64>, tabs: &HashMap<u64, u64>) -> Vec<Workspace> {
+    raw.iter()
+        .map(|ws| {
+            let mut ws = ws.clone();
+            for screen in &mut ws.screens {
+                for pane in &mut screen.panes {
+                    if let Some(index) = tabs.get(&pane.id).and_then(|s| pane.tabs.iter().position(|t| t.surface == *s)) {
+                        pane.active_tab = index;
+                    }
+                }
+            }
+            let shown = screens
+                .get(&ws.id)
+                .and_then(|id| ws.screens.iter().find(|s| s.id == *id))
+                .or_else(|| ws.screens.iter().find(|s| s.active))
+                .or_else(|| ws.screens.first())
+                .cloned();
+            if let Some(screen) = shown {
+                ws.screen = Some(screen.id);
+                ws.layout = screen.layout;
+                ws.panes = screen.panes;
+                ws.active_pane = screen.active_pane;
+                ws.zoomed = screen.zoomed;
+            }
+            ws.title = ws
+                .active_pane
+                .and_then(|id| ws.panes.iter().find(|p| p.id == id))
+                .and_then(|p| p.active())
+                .map(|t| t.name.clone().unwrap_or_else(|| t.title.clone()))
+                .unwrap_or_default();
+            ws
+        })
+        .collect()
+}
+
+/// Re-derive the shown tree after a local selection change, and redraw.
+fn reselect(state: &Shared) {
+    let ui = {
+        let mut st = state.borrow_mut();
+        st.workspaces = apply_choices(&st.raw, &st.screen_choice, &st.tab_choice);
+        st.ui.clone()
+    };
+    if let Some(ui) = ui {
+        render(state, &ui);
+    }
+}
+
+/// Show `screen` of the shown workspace (this window only).
+fn choose_screen(state: &Shared, workspace: u64, screen: u64) {
+    state.borrow_mut().screen_choice.insert(workspace, screen);
+    reselect(state);
+}
+
+/// Show tab `surface` in `pane` (this window only).
+fn choose_tab(state: &Shared, pane: u64, surface: u64) {
+    state.borrow_mut().tab_choice.insert(pane, surface);
+    reselect(state);
+}
+
+/// Step the shown screen or a pane's tab by `delta`, wrapping.
+fn step_screen(state: &Shared, delta: isize) {
+    let next = state.borrow().workspace().and_then(|ws| {
+        let index = ws.screens.iter().position(|s| Some(s.id) == ws.screen)? as isize;
+        let next = (index + delta).rem_euclid(ws.screens.len() as isize) as usize;
+        Some((ws.id, ws.screens[next].id))
+    });
+    if let Some((workspace, screen)) = next {
+        choose_screen(state, workspace, screen);
+    }
+}
+
+fn step_tab(state: &Shared, pane: u64, delta: isize) {
+    let next = state.borrow().workspace().and_then(|ws| {
+        let pane = ws.panes.iter().find(|p| p.id == pane)?;
+        if pane.tabs.is_empty() {
+            return None;
+        }
+        let next = (pane.active_tab as isize + delta).rem_euclid(pane.tabs.len() as isize) as usize;
+        Some(pane.tabs[next].surface)
+    });
+    if let Some(surface) = next {
+        choose_tab(state, pane, surface);
+    }
 }
 
 /// A container's children except popovers attached to it (an open rename
@@ -734,8 +859,8 @@ fn on_double_click(widget: &impl IsA<gtk::Widget>, on_double: impl Fn() + 'stati
 }
 
 /// The screen strip: one button per screen (number, name, attention badge),
-/// `×` to close one, `+` for a new one. Selecting goes through the server so
-/// the TUI shows the same screen.
+/// `×` to close one, `+` for a new one. Which screen is shown is this
+/// window's own choice.
 fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
     for child in content_children(&ui.screens) {
         ui.screens.remove(&child);
@@ -773,8 +898,8 @@ fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
         }
         button.set_tooltip_text(Some("Switch screen (Ctrl+Shift+PageDown/PageUp)"));
         button.connect_clicked({
-            let send = send.clone();
-            move |_| send(json!({ "cmd": "select-screen", "index": index }))
+            let (state, workspace, screen_id) = (state.clone(), ws.id, screen.id);
+            move |_| choose_screen(&state, workspace, screen_id)
         });
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
@@ -1072,16 +1197,15 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         }
     });
 
-    // Focusing a terminal makes its pane the shortcut target and the
-    // server's active pane (so the TUI and new tabs follow).
+    // Focusing a terminal makes its pane the shortcut target (client-local).
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let state = state.clone();
         move |_| {
+            // Client-local, like the rest of the selection.
             let changed = state.borrow().focused != Some(id);
             if changed {
                 state.borrow_mut().focused = Some(id);
-                state.borrow().send(Ctl::request(json!({ "cmd": "focus-pane", "pane": id })));
                 update_focus_marks(&state);
             }
         }
@@ -1136,7 +1260,6 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         move |_| {
             if state.borrow().focused != Some(id) {
                 state.borrow_mut().focused = Some(id);
-                state.borrow().send(Ctl::request(json!({ "cmd": "focus-pane", "pane": id })));
                 update_focus_marks(&state);
             }
         }
@@ -1295,8 +1418,8 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
         }
         let (pane_id, surface) = (pane.id, tab.surface);
         button.connect_clicked({
-            let send = send.clone();
-            move |_| send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane_id, "index": index })))
+            let state = state.clone();
+            move |_| choose_tab(&state, pane_id, surface)
         });
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
@@ -1551,11 +1674,17 @@ fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
         let mut st = state.borrow_mut();
         st.selected = Some(ws_id);
         st.focused = Some(pane_id);
-        // Screen selection acts on the active workspace, so select that first.
-        st.send(Ctl::request(json!({ "cmd": "select-workspace", "index": ws_index })));
-        st.send(Ctl::request(json!({ "cmd": "select-screen", "index": screen_index })));
-        st.send(Ctl::request(json!({ "cmd": "select-tab", "pane": pane_id, "index": index })));
-        st.send(Ctl::request(json!({ "cmd": "focus-pane", "pane": pane_id })));
+        let screen_id = st.raw.get(ws_index).and_then(|ws| ws.screens.get(screen_index)).map(|s| s.id);
+        if let Some(screen_id) = screen_id {
+            st.screen_choice.insert(ws_id, screen_id);
+        }
+        let surface = st.raw.get(ws_index).and_then(|ws| ws.screens.get(screen_index)).and_then(|s| {
+            s.panes.iter().find(|p| p.id == pane_id).and_then(|p| p.tabs.get(index)).map(|t| t.surface)
+        });
+        if let Some(surface) = surface {
+            st.tab_choice.insert(pane_id, surface);
+        }
+        st.workspaces = apply_choices(&st.raw, &st.screen_choice, &st.tab_choice);
     }
     let position = state.borrow().workspaces.iter().position(|w| w.id == ws_id);
     if let Some(row) = position.and_then(|i| ui.list.row_at_index(i as i32)) {

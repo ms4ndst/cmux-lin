@@ -5,7 +5,7 @@ A throwaway prototype of a native GTK4 window for a cmux-tui session. It's here 
 The cmux-tui server stays in charge of everything. This window is just another client:
 
 - the sidebar lists the session's workspaces (re-read every 1.5 s, and straight after every action);
-- clicking a workspace makes it the session's active workspace, so the TUI follows, and when it's switched elsewhere (in the TUI), the window follows;
+- which workspace, screen, tab and pane you're looking at belongs to this window alone, as in upstream's design: switching here doesn't move the TUI or another window, and switching there doesn't move this one. Things just created (a new workspace, screen or tab, including one a tab was moved into) come into view;
 - a screen strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout): click one to switch, `×` to close it and its terminals, `+` for a new one. Each screen button shows the most urgent agent badge on that screen;
 - the active screen's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
 - every pane has a tab strip and a VTE terminal (the widget GNOME Terminal uses) for its active tab;
@@ -15,14 +15,14 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - the pane menu also has **Undo layout change** (`Ctrl+Shift+U`, the screen's last split, swap, zoom or resize) and **Move tab to new workspace**. An undo that would close panes asks first and says how many;
 - a zoomed pane fills its screen (zoom from the pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom;
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
-- keystrokes and pastes go to the pane you're typing in, and focusing a pane makes it the session's active pane;
+- keystrokes and pastes go to the pane you're typing in;
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
 - terminal colours follow the active cmux theme;
 - agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
 - the header's `+` creates a workspace;
 - if the session stops or restarts, the window dims and waits, then reconnects by itself and re-attaches every pane (it can also be started before the session exists).
 
-All layout changes are requests to the server; the window only redraws from the tree the server reports back, so it can't drift from the TUI.
+All layout changes (splits, tabs, moves, zoom, names) are requests to the server, and the window redraws from the tree the server reports back, so the layout can't drift from the TUI's. Only the selection is the window's own.
 
 ## Browser tabs
 
