@@ -131,7 +131,12 @@ cmux-lin is an unofficial Linux build of other people's work. It isn't affiliate
 
 ## License
 
-Upstream cmux and Ghostty are GPL-3.0-or-later, so the binary you build here is GPL-3.0-or-later too. The files in `patches/` modify upstream source and are distributed under GPL-3.0-or-later as derivative works. The build scripts, themes and docs are this repo's own.
+This repository is licensed under the GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
+
+- **cmux-tui** is GPL-3.0-or-later under upstream cmux's top-level license (a few unrelated upstream server directories are BUSL-1.1; none of them are built here). The binary you build is therefore GPL-3.0-or-later.
+- **Ghostty** is MIT-licensed, which is compatible with the GPL build.
+- **`patches/`** modifies upstream cmux-tui source, so the patches are GPL-3.0-or-later derivative works.
+- **Build scripts, themes and docs** are this repo's own work, released under the same GPL-3.0-or-later terms.
 
 ## Desktop pairing
 
