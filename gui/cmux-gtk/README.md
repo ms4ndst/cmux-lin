@@ -9,7 +9,9 @@ The cmux-tui server stays in charge of everything. This window is just another c
 - a screen strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout): click one to switch, `×` to close it and its terminals, `+` for a new one. Each screen button shows the most urgent agent badge on that screen;
 - the active screen's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
 - every pane has a tab strip and a VTE terminal (the widget GNOME Terminal uses) for its active tab;
-- tab strip: click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down;
+- tab strip: click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down, `⋮` for the pane menu (zoom, swap with a neighbour, rename tab, close pane);
+- double-click a workspace, screen or tab to rename it; an empty name goes back to the default;
+- a zoomed pane fills its screen (zoom from the pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom;
 - browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
 - keystrokes and pastes go to the pane you're typing in, and focusing a pane makes it the session's active pane;
 - resizing the window or a pane resizes that terminal on the server, so the shell reflows;
@@ -76,6 +78,7 @@ They act on the pane you're typing in:
 | `Ctrl+Shift+O` | Split down |
 | `Ctrl+Shift+B` | New browser tab |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
+| `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
 
@@ -109,8 +112,9 @@ The protocol's colour messages carry foreground, background, cursor and selectio
 
 ## Not done
 
-- renaming screens, workspaces and tabs from the window (names set elsewhere are shown);
-- zoom, pane swap, and other layout commands beyond split/close;
+- dragging tabs between panes, and moving tabs or panes between workspaces;
+- layout undo, and the TUI's viewport (scrolling column) layouts;
+- the TUI's sidebar views (machines, files, custom sidebar plugins);
 
 ## Debugging
 

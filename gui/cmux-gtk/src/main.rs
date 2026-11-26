@@ -226,6 +226,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
+    // Single click selects; double-click (row activation) renames.
+    list.set_activate_on_single_click(false);
     let placeholder = gtk::Label::new(Some("No workspaces.\nPress + to create one."));
     placeholder.set_justify(gtk::Justification::Center);
     placeholder.add_css_class("dim-label");
@@ -335,6 +337,18 @@ fn build_ui(app: &gtk::Application, session: &str) {
                 state.borrow().send(Ctl::request(json!({ "cmd": "select-workspace", "index": index })));
                 render(&state, &ui);
             }
+        }
+    });
+
+    list.connect_row_activated({
+        let state = state.clone();
+        move |list, row| {
+            let ws = state.borrow().workspaces.get(row.index() as usize).cloned();
+            let Some(ws) = ws else { return };
+            let ctl = state.borrow().ctl.clone();
+            rename_popover(list, row, &ws.name, move |name| {
+                let _ = ctl.send(Ctl::request(json!({ "cmd": "rename-workspace", "workspace": ws.id, "name": name })));
+            });
         }
     });
 
@@ -519,6 +533,9 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>e", |st, pane| st.send(split(pane, "right")));
     bind("<Control><Shift>o", |st, pane| st.send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.send(new_browser_tab(pane)));
+    bind("<Control><Shift>z", |st, pane| {
+        st.send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })));
+    });
     bind("<Control><Shift>n", |st, _| {
         if let Some(ws) = st.workspace() {
             st.send(Ctl::request(json!({ "cmd": "new-screen", "workspace": ws.id })));
@@ -608,7 +625,8 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
 
     // Rebuild the sidebar rows. Selecting a row fires `row-selected`, whose
     // handler sees `selected` already set and does nothing.
-    while let Some(child) = ui.list.first_child() {
+    // Only rows: the placeholder and any rename popover stay.
+    for child in content_children(&ui.list).into_iter().filter(|c| c.is::<gtk::ListBoxRow>()) {
         ui.list.remove(&child);
     }
     for ws in &workspaces {
@@ -621,11 +639,81 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     render(state, ui);
 }
 
+/// A container's children except popovers attached to it (an open rename
+/// popover must survive the container being redrawn).
+fn content_children(container: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+    let mut children = Vec::new();
+    let mut next = container.first_child();
+    while let Some(child) = next {
+        next = child.next_sibling();
+        if !child.is::<gtk::Popover>() {
+            children.push(child);
+        }
+    }
+    children
+}
+
+/// Edit a name in place: a popover with an entry, pointing at `target` but
+/// parented to `host`, a widget that outlives redraws of `target` (sidebar
+/// rows and strip buttons are rebuilt on every tree change). Enter saves; an
+/// empty name clears it back to the default; Escape cancels.
+fn rename_popover(
+    host: &impl IsA<gtk::Widget>,
+    target: &impl IsA<gtk::Widget>,
+    current: &str,
+    save: impl Fn(String) + 'static,
+) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(host);
+    if let Some(bounds) = target.compute_bounds(host) {
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(
+            bounds.x() as i32,
+            bounds.y() as i32,
+            bounds.width() as i32,
+            bounds.height() as i32,
+        )));
+    }
+    let entry = gtk::Entry::new();
+    entry.set_text(current);
+    entry.set_width_chars(24);
+    entry.set_placeholder_text(Some("Name (empty for default)"));
+    popover.set_child(Some(&entry));
+    entry.connect_activate({
+        let popover = popover.clone();
+        move |entry| {
+            save(entry.text().trim().to_string());
+            popover.popdown();
+        }
+    });
+    // Detach once closed (from the idle loop: not inside the signal).
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+    entry.grab_focus();
+    entry.select_region(0, -1);
+}
+
+/// Runs `on_double` when `widget` is double-clicked (single clicks still do
+/// whatever the widget does).
+fn on_double_click(widget: &impl IsA<gtk::Widget>, on_double: impl Fn() + 'static) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(1);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(move |_, presses, _, _| {
+        if presses == 2 {
+            on_double();
+        }
+    });
+    widget.add_controller(gesture);
+}
+
 /// The screen strip: one button per screen (number, name, attention badge),
 /// `×` to close one, `+` for a new one. Selecting goes through the server so
 /// the TUI shows the same screen.
 fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
-    while let Some(child) = ui.screens.first_child() {
+    for child in content_children(&ui.screens) {
         ui.screens.remove(&child);
     }
     let Some(ws) = ws else {
@@ -674,6 +762,17 @@ fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
             let send = send.clone();
             move |_| send(json!({ "cmd": "close-screen", "screen": screen_id }))
         });
+        on_double_click(&button, {
+            let (strip, button, send, current) =
+                (ui.screens.clone(), button.clone(), send.clone(), screen.name.clone().unwrap_or_default());
+            move || {
+                let send = send.clone();
+                rename_popover(&strip, &button, &current, move |name| {
+                    send(json!({ "cmd": "rename-screen", "screen": screen_id, "name": name }));
+                });
+            }
+        });
+        button.set_tooltip_text(Some("Switch screen (Ctrl+Shift+PageDown/PageUp) · double-click to rename"));
         let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         group.append(&button);
         group.append(&close);
@@ -735,6 +834,11 @@ fn render(state: &Shared, ui: &Ui) {
         clear_content(state, ui);
         ui.status.set_text("This workspace has no panes");
         return;
+    };
+    // A zoomed pane is shown alone; the split tree is kept for unzooming.
+    let layout = match ws.zoomed {
+        Some(pane) if layout.panes().contains(&pane) => Layout::Leaf(pane),
+        _ => layout,
     };
 
     let signature = format!("{}:{}:{}", ws.id, ws.screen.unwrap_or(0), layout.signature());
@@ -1022,6 +1126,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("pane");
+    install_pane_actions(state, &root, &tabbar, id);
     root.append(&tabbar);
     root.append(&stack);
 
@@ -1129,7 +1234,7 @@ fn cell_pixels(term: &vte4::Terminal) -> (i32, i32) {
 }
 
 fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<Attn>]) {
-    while let Some(child) = tabbar.first_child() {
+    for child in content_children(tabbar) {
         tabbar.remove(&child);
     }
     let ctl = state.borrow().ctl.clone();
@@ -1137,7 +1242,11 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
         let _ = ctl.send(ctl_msg);
     };
     for (index, tab) in pane.tabs.iter().enumerate() {
-        let title = if tab.title.is_empty() { format!("Tab {}", index + 1) } else { tab.title.clone() };
+        let title = match (&tab.name, tab.title.is_empty()) {
+            (Some(name), _) => name.clone(),
+            (None, true) => format!("Tab {}", index + 1),
+            (None, false) => tab.title.clone(),
+        };
         let label = gtk::Label::new(Some(&title));
         label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         label.set_max_width_chars(24);
@@ -1171,6 +1280,16 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
             let send = send.clone();
             move |_| send(Ctl::request(json!({ "cmd": "close-surface", "surface": surface })))
         });
+        on_double_click(&button, {
+            let (tabbar, button, send, current) =
+                (tabbar.clone(), button.clone(), send.clone(), tab.name.clone().unwrap_or_default());
+            move || {
+                let send = send.clone();
+                rename_popover(&tabbar, &button, &current, move |name| {
+                    send(Ctl::request(json!({ "cmd": "rename-surface", "surface": surface, "name": name })));
+                });
+            }
+        });
         let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         group.append(&button);
         group.append(&close);
@@ -1198,6 +1317,79 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
         });
         tabbar.append(&button);
     }
+
+    // Pane menu: zoom, swap, rename, close (actions in the pane's `pane.`
+    // group, see `install_pane_actions`).
+    let menu = gio::Menu::new();
+    let view = gio::Menu::new();
+    view.append(Some("Zoom / unzoom (Ctrl+Shift+Z)"), Some("pane.zoom"));
+    menu.append_section(None, &view);
+    let swap = gio::Menu::new();
+    for (label, dir) in [("Swap with left", "left"), ("Swap with right", "right"), ("Swap with above", "up"), ("Swap with below", "down")] {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("pane.swap"), Some(&dir.to_variant()));
+        swap.append_item(&item);
+    }
+    menu.append_section(None, &swap);
+    let manage = gio::Menu::new();
+    manage.append(Some("Rename tab…"), Some("pane.rename"));
+    manage.append(Some("Close pane"), Some("pane.close"));
+    menu.append_section(None, &manage);
+    let more = gtk::MenuButton::new();
+    more.set_icon_name("view-more-symbolic");
+    more.add_css_class("flat");
+    more.set_tooltip_text(Some("Pane menu"));
+    more.set_menu_model(Some(&menu));
+    tabbar.append(&more);
+}
+
+/// The `pane.` actions behind a pane's menu.
+fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: u64) {
+    let group = gio::SimpleActionGroup::new();
+    let ctl = state.borrow().ctl.clone();
+    let send = move |request: Value| {
+        let _ = ctl.send(Ctl::request(request));
+    };
+    let zoom = gio::SimpleAction::new("zoom", None);
+    zoom.connect_activate({
+        let send = send.clone();
+        move |_, _| send(json!({ "cmd": "zoom-pane", "pane": id, "mode": "toggle" }))
+    });
+    group.add_action(&zoom);
+    let swap = gio::SimpleAction::new("swap", Some(glib::VariantTy::STRING));
+    swap.connect_activate({
+        let send = send.clone();
+        move |_, dir| {
+            if let Some(dir) = dir.and_then(|d| d.get::<String>()) {
+                send(json!({ "cmd": "swap-pane", "pane": id, "dir": dir }));
+            }
+        }
+    });
+    group.add_action(&swap);
+    let rename = gio::SimpleAction::new("rename", None);
+    rename.connect_activate({
+        let (state, tabbar, send) = (state.clone(), tabbar.clone(), send.clone());
+        move |_, _| {
+            // The pane's active tab.
+            let active = {
+                let st = state.borrow();
+                st.workspace()
+                    .and_then(|ws| ws.panes.iter().find(|p| p.id == id))
+                    .and_then(|pane| pane.active())
+                    .map(|tab| (tab.surface, tab.name.clone().unwrap_or_default()))
+            };
+            let Some((surface, current)) = active else { return };
+            let send = send.clone();
+            rename_popover(&tabbar, &tabbar, &current, move |name| {
+                send(json!({ "cmd": "rename-surface", "surface": surface, "name": name }));
+            });
+        }
+    });
+    group.add_action(&rename);
+    let close = gio::SimpleAction::new("close", None);
+    close.connect_activate(move |_, _| send(json!({ "cmd": "close-pane", "pane": id })));
+    group.add_action(&close);
+    root.insert_action_group("pane", Some(&group));
 }
 
 /// Tint the focused pane's tab strip so it's clear where typing goes.

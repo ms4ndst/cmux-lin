@@ -50,6 +50,8 @@ pub struct Workspace {
     pub layout: Option<Layout>,
     pub panes: Vec<Pane>,
     pub active_pane: Option<u64>,
+    /// The active screen's zoomed pane, shown alone while set.
+    pub zoomed: Option<u64>,
 }
 
 impl Workspace {
@@ -68,6 +70,7 @@ pub struct Screen {
     pub layout: Option<Layout>,
     pub panes: Vec<Pane>,
     pub active_pane: Option<u64>,
+    pub zoomed: Option<u64>,
 }
 
 /// The active screen's split tree.
@@ -116,6 +119,8 @@ pub struct Tab {
     pub surface: u64,
     /// Stable canonical tab id (`tab_…`).
     pub tab_id: Option<String>,
+    /// Name the user gave the tab (shown instead of the title when set).
+    pub name: Option<String>,
     pub title: String,
     pub terminal: bool,
     /// Level of an unread notification on this tab (`info`, `warning`,
@@ -562,9 +567,9 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 .map(|screens| screens.iter().filter_map(parse_screen).collect())
                 .unwrap_or_default();
             let shown = screens.iter().find(|s| s.active).or_else(|| screens.first()).cloned();
-            let (screen, layout, panes, active_pane) = match shown {
-                Some(s) => (Some(s.id), s.layout, s.panes, s.active_pane),
-                None => (None, None, Vec::new(), None),
+            let (screen, layout, panes, active_pane, zoomed) = match shown {
+                Some(s) => (Some(s.id), s.layout, s.panes, s.active_pane, s.zoomed),
+                None => (None, None, Vec::new(), None, None),
             };
             let title = active_pane
                 .and_then(|id| panes.iter().find(|p| p.id == id))
@@ -581,6 +586,7 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 layout,
                 panes,
                 active_pane,
+                zoomed,
             }
         })
         .collect()
@@ -598,6 +604,7 @@ fn parse_screen(screen: &Value) -> Option<Screen> {
             .map(|panes| panes.iter().filter_map(parse_pane).collect())
             .unwrap_or_default(),
         active_pane: screen.get("active_pane").and_then(Value::as_u64),
+        zoomed: screen.get("zoomed_pane").and_then(Value::as_u64),
     })
 }
 
@@ -612,6 +619,7 @@ fn parse_pane(pane: &Value) -> Option<Pane> {
                     Some(Tab {
                         surface: tab.get("surface")?.as_u64()?,
                         tab_id: tab.get("tab_resource_id").and_then(Value::as_str).map(str::to_string),
+                        name: tab.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).map(str::to_string),
                         title: tab.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
                         terminal: tab.get("kind").and_then(Value::as_str) == Some("pty"),
                         unread: marker
