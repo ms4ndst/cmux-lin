@@ -146,6 +146,9 @@ pub enum UiMsg {
     /// The selection read from a browser tab for copy (or cut), for the
     /// attachment with this `generation`.
     Copied { generation: u64, result: Result<String, String>, cut: bool },
+    /// Undoing the layout on `pane`'s screen would close `closes` panes:
+    /// ask, then confirm with `revision`.
+    UndoConfirm { pane: u64, revision: u64, closes: usize },
     /// A page in the attachment with this `generation` asked for a file:
     /// show a file dialog and answer with [`provider::FileChooserWatch`].
     FileChooser { generation: u64, node: i64, multiple: bool },
@@ -188,6 +191,9 @@ pub enum Ctl {
     NewWorkspace,
     /// Re-poll now (sent by the event thread when something changed).
     Poke,
+    /// Undo the latest layout change on `pane`'s screen; `confirm` is the
+    /// preview revision when confirming an undo that closes panes.
+    Undo { pane: u64, confirm: Option<u64> },
     /// Any protocol command as a JSON object with `cmd` (e.g. `split`,
     /// `new-tab`, `select-tab`, `close-surface`, `focus-pane`).
     Request(Value),
@@ -276,6 +282,7 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
         for ctl in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             let result = match ctl {
                 Ctl::Poke => Ok(()),
+                Ctl::Undo { pane, confirm } => undo_layout(client, ui, pane, confirm),
                 Ctl::NewWorkspace => client
                     .new_workspace(NewWorkspaceRequest {
                         name: Optional::Value("gtk".to_string()),
@@ -304,6 +311,34 @@ fn list_workspaces(client: &mut Client) -> Result<Vec<Workspace>, Error> {
         response.get("data").cloned().unwrap_or(Value::Null)
     };
     Ok(parse_workspaces(&tree))
+}
+
+/// Run `undo-layout`. An undo that would close panes comes back as a preview
+/// the person must confirm ([`UiMsg::UndoConfirm`]); nothing to undo is
+/// reported, not treated as a failure.
+fn undo_layout(client: &mut Client, ui: &async_channel::Sender<UiMsg>, pane: u64, confirm: Option<u64>) -> Result<(), Error> {
+    let mut request = serde_json::Map::new();
+    request.insert("cmd".into(), json!("undo-layout"));
+    request.insert("pane".into(), json!(pane));
+    if let Some(revision) = confirm {
+        request.insert("revision".into(), json!(revision));
+        request.insert("confirm_close".into(), json!(true));
+    }
+    let response = match client.request_raw(request) {
+        Ok(response) => response,
+        Err(error) if error.to_string().contains("no layout change to undo") => {
+            let _ = ui.send_blocking(UiMsg::Status("Nothing to undo on this screen".into()));
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let data = response.get("data").cloned().unwrap_or(response);
+    if data.get("confirmation_required") == Some(&Value::Bool(true)) {
+        let revision = data.get("revision").and_then(Value::as_u64).unwrap_or(0);
+        let closes = data.get("closes_panes").and_then(Value::as_array).map_or(0, Vec::len);
+        let _ = ui.send_blocking(UiMsg::UndoConfirm { pane, revision, closes });
+    }
+    Ok(())
 }
 
 /// The agent roster as surface → status. `status` is the vocabulary every

@@ -226,6 +226,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
+    // Fill the sidebar, so the space below the rows is a drop target too.
+    list.set_vexpand(true);
     // Single click selects; double-click (row activation) renames.
     list.set_activate_on_single_click(false);
     let placeholder = gtk::Label::new(Some("No workspaces.\nPress + to create one."));
@@ -340,6 +342,26 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     });
 
+    // Drop a tab on a workspace to move it there, or below the rows for a new
+    // workspace. The move keeps the terminal or browser running.
+    let sidebar_drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+    sidebar_drop.connect_drop({
+        let state = state.clone();
+        move |target, value, _, y| {
+            let Some(surface) = dragged_surface(value) else { return false };
+            let list = target.widget().and_downcast::<gtk::ListBox>();
+            let row = list.and_then(|l| l.row_at_y(y as i32));
+            let st = state.borrow();
+            let mut request = json!({ "cmd": "move-tab-to-workspace", "surface": surface });
+            if let Some(ws) = row.and_then(|r| st.workspaces.get(r.index() as usize)) {
+                request["workspace"] = json!(ws.id);
+            }
+            st.send(Ctl::request(request));
+            true
+        }
+    });
+    list.add_controller(sidebar_drop);
+
     list.connect_row_activated({
         let state = state.clone();
         move |list, row| {
@@ -386,6 +408,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
                 match msg {
                     UiMsg::Connected => set_live(&ui, true),
                     UiMsg::Copied { generation, result, cut } => on_copied(&state, &ui, generation, result, cut),
+                    UiMsg::UndoConfirm { pane, revision, closes } => confirm_undo(&state, pane, revision, closes),
                     UiMsg::FileChooser { generation, node, multiple } => {
                         choose_files(&state, &ui, generation, node, multiple);
                     }
@@ -533,6 +556,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>e", |st, pane| st.send(split(pane, "right")));
     bind("<Control><Shift>o", |st, pane| st.send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.send(new_browser_tab(pane)));
+    bind("<Control><Shift>u", |st, pane| st.send(Ctl::Undo { pane, confirm: None }));
     bind("<Control><Shift>z", |st, pane| {
         st.send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })));
     });
@@ -1127,6 +1151,8 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("pane");
     install_pane_actions(state, &root, &tabbar, id);
+    install_tab_drop(state, &tabbar, &tabbar, id);
+    install_tab_drop(state, &stack, &tabbar, id);
     root.append(&tabbar);
     root.append(&stack);
 
@@ -1290,7 +1316,20 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
                 });
             }
         });
+        // Drag the tab to reorder it, move it to another pane, or drop it on
+        // a workspace in the sidebar.
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::MOVE);
+        drag.connect_prepare(move |_, _, _| {
+            Some(gdk::ContentProvider::for_value(&format!("{TAB_DRAG_PREFIX}{surface}").to_value()))
+        });
+        drag.connect_drag_begin({
+            let button = button.clone();
+            move |source, _| source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&button))), 0, 0)
+        });
+        button.add_controller(drag);
         let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        group.add_css_class("tab-group");
         group.append(&button);
         group.append(&close);
         tabbar.append(&group);
@@ -1332,6 +1371,8 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
     }
     menu.append_section(None, &swap);
     let manage = gio::Menu::new();
+    manage.append(Some("Undo layout change (Ctrl+Shift+U)"), Some("pane.undo"));
+    manage.append(Some("Move tab to new workspace"), Some("pane.move-new-workspace"));
     manage.append(Some("Rename tab…"), Some("pane.rename"));
     manage.append(Some("Close pane"), Some("pane.close"));
     menu.append_section(None, &manage);
@@ -1386,6 +1427,29 @@ fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: 
         }
     });
     group.add_action(&rename);
+    let undo = gio::SimpleAction::new("undo", None);
+    undo.connect_activate({
+        let state = state.clone();
+        move |_, _| state.borrow().send(Ctl::Undo { pane: id, confirm: None })
+    });
+    group.add_action(&undo);
+    let move_new = gio::SimpleAction::new("move-new-workspace", None);
+    move_new.connect_activate({
+        let (state, send) = (state.clone(), send.clone());
+        move |_, _| {
+            let surface = state
+                .borrow()
+                .workspace()
+                .and_then(|ws| ws.panes.iter().find(|p| p.id == id))
+                .and_then(|p| p.active())
+                .map(|t| t.surface);
+            if let Some(surface) = surface {
+                // No workspace: the server creates one and selects it.
+                send(json!({ "cmd": "move-tab-to-workspace", "surface": surface }));
+            }
+        }
+    });
+    group.add_action(&move_new);
     let close = gio::SimpleAction::new("close", None);
     close.connect_activate(move |_, _| send(json!({ "cmd": "close-pane", "pane": id })));
     group.add_action(&close);
@@ -1501,6 +1565,61 @@ fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
     if let Some(window) = state.borrow().window.upgrade() {
         window.present();
     }
+}
+
+/// Undoing would close panes: say how many and confirm (with the preview's
+/// revision, so a layout that changed meanwhile is refused, not undone).
+fn confirm_undo(state: &Shared, pane: u64, revision: u64, closes: usize) {
+    let Some(window) = state.borrow().window.upgrade() else { return };
+    let dialog = gtk::AlertDialog::builder()
+        .message("Undo the last layout change?")
+        .detail(format!(
+            "This closes {closes} pane{}. Terminals keep running in the session, but those panes and their tab placement go away.",
+            if closes == 1 { "" } else { "s" }
+        ))
+        .buttons(["Cancel", "Undo"])
+        .cancel_button(0)
+        .default_button(1)
+        .modal(true)
+        .build();
+    let ctl = state.borrow().ctl.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(1) = dialog.choose_future(Some(&window)).await {
+            let _ = ctl.send(Ctl::Undo { pane, confirm: Some(revision) });
+        }
+    });
+}
+
+/// Drag payload for a tab: its surface id.
+const TAB_DRAG_PREFIX: &str = "cmux-tab:";
+
+fn dragged_surface(value: &glib::Value) -> Option<u64> {
+    value.get::<String>().ok()?.strip_prefix(TAB_DRAG_PREFIX)?.parse().ok()
+}
+
+/// Accept tab drops on a pane: on its tab strip at the position dropped, or
+/// on its body at the end. Moving within the same pane reorders.
+fn install_tab_drop(state: &Shared, target_widget: &impl IsA<gtk::Widget>, tabbar: &gtk::Box, pane: u64) {
+    let drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+    let (ctl, tabbar, on_strip) = (state.borrow().ctl.clone(), tabbar.clone(), target_widget.as_ref() == tabbar.upcast_ref::<gtk::Widget>());
+    drop.connect_drop(move |_, value, x, _| {
+        let Some(surface) = dragged_surface(value) else { return false };
+        // Index among this pane's tabs: those whose middle is left of the
+        // drop point (the server reads it against the pre-move list).
+        let groups: Vec<gtk::Widget> =
+            content_children(&tabbar).into_iter().filter(|w| w.has_css_class("tab-group")).collect();
+        let index = if on_strip {
+            groups
+                .iter()
+                .filter(|g| g.compute_bounds(&tabbar).is_some_and(|b| f64::from(b.x() + b.width() / 2.0) < x))
+                .count()
+        } else {
+            groups.len()
+        };
+        let _ = ctl.send(Ctl::request(json!({ "cmd": "move-tab", "surface": surface, "pane": pane, "index": index })));
+        true
+    });
+    target_widget.add_controller(drop);
 }
 
 /// A page asked for a file: show the desktop file dialog (one file or
