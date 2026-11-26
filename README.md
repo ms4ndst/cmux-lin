@@ -32,8 +32,11 @@ cmux-lin/
 │   ├── 20-fetch-source.sh         # clone cmux at pin, init ghostty submodule
 │   ├── 30-build.sh               # cargo build -p cmux-tui (release)
 │   └── 40-install.sh             # install cmux-tui + `cmux` symlink to ~/.local/bin
+├── gui/cmux-gtk/             # prototype native GTK4 window for a session (see its README)
 └── build/                    # (gitignored) source checkout + target/
 ```
+
+`gui/cmux-gtk` is an experimental native Linux window for a running session: a workspace sidebar plus a VTE terminal driven over cmux's protocol. It's a prototype, not a replacement for the TUI; see [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md).
 
 ## Build
 

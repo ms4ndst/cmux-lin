@@ -1,0 +1,21 @@
+[package]
+name = "cmux-gtk"
+version = "0.1.0"
+edition = "2024"
+description = "Prototype native GTK4 frontend for a cmux-tui session"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# Upstream's Rust SDK, from the pinned source checkout (scripts/20-fetch-source.sh).
+cmux-sdk = { path = "../../build/cmux/cmux-tui/bindings/rust" }
+# v4_10+ is required by vte4 0.10 (it implements gtk::Accessible) but not
+# requested by it; the system GTK is 4.22, so 4.12 is safely below it.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+vte4 = "0.10"
+async-channel = "2"
+base64 = "0.22"
+serde_json = "1"
+
+# Standalone: not part of upstream's cargo workspace.
+[workspace]
