@@ -32,6 +32,7 @@ mod backend;
 mod browser;
 mod files;
 mod find;
+mod layout;
 mod meta;
 mod notes;
 mod palette;
@@ -221,6 +222,8 @@ struct State {
     /// and the workspaces the background thread should look at.
     meta: HashMap<u64, meta::WsMeta>,
     meta_targets: meta::Targets,
+    /// A tab a just-built workspace layout wants shown, once the tree has it.
+    pending_focus: Option<u64>,
 }
 
 impl State {
@@ -503,6 +506,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         font_scale: load_font_scale(),
         meta: HashMap::new(),
         meta_targets: meta_targets.clone(),
+        pending_focus: None,
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -717,6 +721,14 @@ fn build_ui(app: &gtk::Application, session: &str) {
                         state.borrow_mut().agents = agents;
                         on_tree(&state, &ui, workspaces);
                         draw_notes(&state, &ui);
+                    }
+                    UiMsg::LayoutBuilt { name, focus, error } => {
+                        match error {
+                            Some(error) => ui.status.set_text(&format!("Couldn't build workspace “{name}”: {error}")),
+                            None => ui.status.set_text(&format!("Opened workspace “{name}”")),
+                        }
+                        state.borrow_mut().pending_focus = focus;
+                        state.borrow().send(Ctl::Poke);
                     }
                     UiMsg::Meta(meta) => {
                         state.borrow_mut().meta = meta;
@@ -1594,6 +1606,37 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     draw_sidebar(state, ui);
     draw_agents(state, ui);
     render(state, ui);
+    // A just-built layout's tab, as soon as the tree has it.
+    let pending = state.borrow().pending_focus;
+    if let Some(surface) = pending {
+        let built = state.borrow().raw.iter().find(|ws| ws.all_tabs().any(|t| t.surface == surface)).cloned();
+        if let Some(ws) = built {
+            {
+                // Its tabs appeared one by one while it was built, and each
+                // came into view as "new"; show the tabs the layout chose.
+                let mut st = state.borrow_mut();
+                st.pending_focus = None;
+                for pane in ws.screens.iter().flat_map(|s| &s.panes) {
+                    st.tab_choice.remove(&pane.id);
+                }
+                st.workspaces = apply_choices(&st.raw, &st.screen_choice, &st.tab_choice);
+            }
+            show_surface_tab(state, ui, surface);
+            // Type into the focused tab straight away (once it's drawn).
+            let state = state.clone();
+            glib::idle_add_local_once(move || {
+                let widget: Option<gtk::Widget> = {
+                    let st = state.borrow();
+                    st.panes.values().find(|v| v.surface == Some(surface)).map(|v| {
+                        if v.browser { v.web.root.clone().upcast() } else { v.term.clone().upcast() }
+                    })
+                };
+                if let Some(widget) = widget {
+                    widget.grab_focus();
+                }
+            });
+        }
+    }
 }
 
 /// Rebuild the sidebar rows. Selecting a row fires `row-selected`, whose
@@ -1808,8 +1851,14 @@ fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
         st.selected.and_then(|ws| st.meta.get(&ws)).and_then(|m| m.cwd.clone())
     };
     let (commands, problems) = custom_commands(cwd.as_deref());
-    for problem in problems {
-        ui.status.set_text(&problem);
+    // Problems in the files show at the top, so they're seen.
+    for (problem, file) in problems {
+        let (status, text) = (ui.status.clone(), format!("{file}: {problem}"));
+        items.push(
+            Item::new(format!("⚠ {problem}"), move || status.set_text(&text))
+                .detail(format!("Skipped, in {file}"))
+                .keywords("error problem cmux.json"),
+        );
     }
     for command in commands {
         let (detail, keywords) = (command.description.clone(), command.keywords.clone());
@@ -1953,9 +2002,12 @@ struct CustomCommand {
     what: CustomRun,
 }
 
+#[derive(Clone)]
 enum CustomRun {
     /// `cmux.json` `command`: typed into the focused terminal and run.
     Type(String),
+    /// `cmux.json` `workspace`: build a new workspace with that layout.
+    Workspace(layout::Spec),
     /// The TUI's `commands[].run`: run as a new tab in the focused pane.
     Tab { argv: Vec<String>, cwd: Option<String> },
 }
@@ -1965,7 +2017,7 @@ enum CustomRun {
 /// `~/.config/cmux/cmux.json`; a project entry wins over a user-wide one with
 /// the same name) and the TUI config's `commands`. Also returns problems to
 /// report (a file that isn't valid JSON).
-fn custom_commands(cwd: Option<&str>) -> (Vec<CustomCommand>, Vec<String>) {
+fn custom_commands(cwd: Option<&str>) -> (Vec<CustomCommand>, Vec<(String, String)>) {
     let mut files = Vec::new();
     if let Some(cwd) = cwd {
         for dir in std::path::Path::new(cwd).ancestors() {
@@ -1988,24 +2040,55 @@ fn custom_commands(cwd: Option<&str>) -> (Vec<CustomCommand>, Vec<String>) {
 
     let mut commands: Vec<CustomCommand> = Vec::new();
     let mut problems = Vec::new();
+    let user_file = config.as_ref().map(|c| c.join("cmux/cmux.json"));
     for file in files {
         let shown = file.display().to_string();
+        let is_user_file = user_file.as_ref() == Some(&file);
         let json = match std::fs::read_to_string(&file).map_err(|e| e.to_string()).and_then(|t| {
             serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())
         }) {
             Ok(json) => json,
             Err(error) => {
-                problems.push(format!("{shown}: {error}"));
+                problems.push((format!("cmux.json isn't valid JSON: {error}"), shown.clone()));
                 continue;
             }
         };
         for entry in json.get("commands").and_then(Value::as_array).into_iter().flatten() {
             let Some(name) = entry.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()) else { continue };
-            // Workspace layouts aren't supported here yet; only commands.
-            let Some(command) = entry.get("command").and_then(Value::as_str) else { continue };
             if commands.iter().any(|c| c.name == name) {
                 continue; // a project entry already defined it
             }
+            if entry.get("workspace").is_some() {
+                // Relative paths start at the project folder (the one holding
+                // `.cmux/`), or for the user-wide file at the workspace's
+                // folder.
+                let base = if is_user_file {
+                    cwd.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("/"))
+                } else {
+                    let dir = file.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+                    if dir.file_name().is_some_and(|n| n == ".cmux") { dir.parent().map(std::path::Path::to_path_buf).unwrap_or(dir) } else { dir }
+                };
+                match layout::parse(name, entry, &base) {
+                    Ok(spec) => {
+                        let keywords = match entry.get("keywords") {
+                            Some(Value::Array(words)) => words.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                            Some(Value::String(words)) => words.clone(),
+                            _ => String::new(),
+                        };
+                        let description = entry.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+                        commands.push(CustomCommand {
+                            name: name.to_string(),
+                            description: if description.is_empty() { format!("Opens workspace “{}”", spec.name) } else { description },
+                            keywords: format!("{keywords} workspace layout {shown}"),
+                            confirm: entry.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                            what: CustomRun::Workspace(spec),
+                        });
+                    }
+                    Err(error) => problems.push((format!("“{name}”: {error}"), shown.clone())),
+                }
+                continue;
+            }
+            let Some(command) = entry.get("command").and_then(Value::as_str) else { continue };
             let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("").to_string();
             let keywords = match entry.get("keywords") {
                 Some(Value::Array(words)) => words.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
@@ -2057,12 +2140,13 @@ fn custom_commands(cwd: Option<&str>) -> (Vec<CustomCommand>, Vec<String>) {
 
 /// Run a custom command, asking first if it says so.
 fn run_custom(state: &Shared, command: &CustomCommand) {
+    if let CustomRun::Workspace(spec) = &command.what {
+        run_layout(state, command, spec.clone());
+        return;
+    }
     let go = {
         let state = state.clone();
-        let what = match &command.what {
-            CustomRun::Type(text) => CustomRun::Type(text.clone()),
-            CustomRun::Tab { argv, cwd } => CustomRun::Tab { argv: argv.clone(), cwd: cwd.clone() },
-        };
+        let what = command.what.clone();
         move || {
             let st = state.borrow();
             let Some(pane) = st.target_pane() else { return };
@@ -2078,6 +2162,7 @@ fn run_custom(state: &Shared, command: &CustomCommand) {
                         }
                     }
                 }
+                CustomRun::Workspace(_) => {}
                 CustomRun::Tab { argv, cwd } => {
                     let mut request = json!({ "cmd": "run", "argv": argv, "pane": pane });
                     if let Some(cwd) = cwd {
@@ -2098,6 +2183,7 @@ fn run_custom(state: &Shared, command: &CustomCommand) {
         .detail(match &command.what {
             CustomRun::Type(text) => text.clone(),
             CustomRun::Tab { argv, .. } => argv.join(" "),
+            CustomRun::Workspace(spec) => format!("Opens workspace “{}”", spec.name),
         })
         .buttons(["Cancel", "Run"])
         .cancel_button(0)
@@ -2109,6 +2195,87 @@ fn run_custom(state: &Shared, command: &CustomCommand) {
             go();
         }
     });
+}
+
+/// Open a workspace layout command, following its `restart` rule when a
+/// workspace with that name exists, and its `confirm`.
+fn run_layout(state: &Shared, command: &CustomCommand, spec: layout::Spec) {
+    let existing = {
+        let st = state.borrow();
+        st.raw.iter().find(|w| w.name == spec.name).map(|w| (w.id, w.all_tabs().filter_map(|t| t.terminal_id.clone()).collect::<Vec<_>>()))
+    };
+    let build = {
+        let state = state.clone();
+        move |spec: layout::Spec, replace: Option<(u64, Vec<String>)>| {
+            let st = state.borrow();
+            if let Some((id, terminals)) = replace {
+                // Replacing: the old workspace and its shells go.
+                st.send(Ctl::Close { request: json!({ "cmd": "close-workspace", "workspace": id }), terminals });
+            }
+            if let Some(ui) = &st.ui {
+                ui.status.set_text(&format!("Opening workspace “{}”…", spec.name));
+            }
+            layout::spawn_build(st.socket_path.clone(), spec, st.ui_tx.clone());
+        }
+    };
+    let ask = |message: String, detail: String, button: &'static str| {
+        let window = state.borrow().window.upgrade();
+        let dialog = gtk::AlertDialog::builder()
+            .message(message)
+            .detail(detail)
+            .buttons(["Cancel", button])
+            .cancel_button(0)
+            .default_button(1)
+            .modal(true)
+            .build();
+        async move { window.is_some() && matches!(dialog.choose_future(window.as_ref()).await, Ok(1)) }
+    };
+    use layout::Restart;
+    match (existing, spec.restart) {
+        (Some((id, _)), Restart::Ignore) => {
+            let ui = state.borrow().ui.clone();
+            let index = state.borrow().workspaces.iter().position(|w| w.id == id);
+            if let (Some(_), Some(index)) = (ui, index) {
+                jump_workspace_index(state, index);
+            }
+        }
+        (Some(old), Restart::Recreate) => {
+            if command.confirm {
+                let question = ask(format!("Run “{}”?", command.name), format!("Replaces workspace “{}”.", spec.name), "Run");
+                glib::spawn_future_local(async move {
+                    if question.await {
+                        build(spec, Some(old));
+                    }
+                });
+            } else {
+                build(spec, Some(old));
+            }
+        }
+        (Some(old), Restart::Confirm) => {
+            let question = ask(
+                format!("Replace workspace “{}”?", spec.name),
+                format!("“{}” already exists. Replacing it ends its {} shell{}.", spec.name, old.1.len(), if old.1.len() == 1 { "" } else { "s" }),
+                "Replace",
+            );
+            glib::spawn_future_local(async move {
+                if question.await {
+                    build(spec, Some(old));
+                }
+            });
+        }
+        _ => {
+            if command.confirm {
+                let question = ask(format!("Run “{}”?", command.name), format!("Opens workspace “{}”.", spec.name), "Run");
+                glib::spawn_future_local(async move {
+                    if question.await {
+                        build(spec, None);
+                    }
+                });
+            } else {
+                build(spec, None);
+            }
+        }
+    }
 }
 
 /// Run a navigation by name (`app.nav`).

@@ -211,6 +211,9 @@ pub enum UiMsg {
     Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
     /// The retained notifications changed (or were read for the first time).
     Notes(Vec<Note>),
+    /// A workspace layout command finished building workspace `name`: the
+    /// tab to focus, or why it failed.
+    LayoutBuilt { name: String, focus: Option<u64>, error: Option<String> },
     /// Workspace details (directory, git branch, listening ports) changed.
     Meta(std::collections::HashMap<u64, crate::meta::WsMeta>),
     /// Output for the attachment with this `generation` (unique across all

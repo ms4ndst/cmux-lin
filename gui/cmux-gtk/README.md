@@ -89,7 +89,71 @@ A project entry wins over a user-wide one with the same name.
 }
 ```
 
-Picking one types its `command` into the focused terminal and runs it, so it runs wherever that shell is. Start it with `cd "$(git rev-parse --show-toplevel)" &&` when it needs the repository root. With `"confirm": true` the palette asks first. Commands with a `workspace` layout instead of a `command` aren't supported yet and are left out.
+Picking one types its `command` into the focused terminal and runs it, so it runs wherever that shell is. Start it with `cd "$(git rev-parse --show-toplevel)" &&` when it needs the repository root. With `"confirm": true` the palette asks first.
+
+### Workspace layout commands
+
+A command with a `workspace` object instead of a `command` opens a new workspace: a tree of splits whose leaves are panes of terminal and browser tabs, in the same format as the macOS app:
+
+```json
+{
+  "commands": [
+    {
+      "name": "API Stack",
+      "restart": "confirm",
+      "workspace": {
+        "name": "API",
+        "cwd": "./services/api",
+        "env": { "PORT": "8080" },
+        "setup": "nvm use",
+        "layout": {
+          "direction": "vertical",
+          "split": 0.65,
+          "children": [
+            { "direction": "horizontal", "children": [
+              { "pane": { "surfaces": [ { "type": "terminal", "name": "Server", "command": "go run ./cmd/api", "focus": true } ] } },
+              { "pane": { "surfaces": [ { "type": "terminal", "name": "Worker", "command": "go run ./cmd/worker", "env": { "QUEUE": "default" } } ] } }
+            ] },
+            { "pane": { "surfaces": [
+              { "type": "terminal", "name": "Logs", "cwd": "/var/log", "command": "tail -F system.log" },
+              { "type": "browser", "name": "Health", "url": "http://localhost:8080/healthz" }
+            ] } }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+**Splits:**
+- A split has a `direction`: `horizontal` puts its two `children` side by side, and `vertical` stacks them.
+- `split` is the first child's share, from 0.1 to 0.9 (default 0.5).
+
+**Panes and tabs:**
+- A pane lists its tabs in `surfaces`.
+- A tab is a `terminal` (with an optional `command`) or a `browser` (with a `url`), and can have a `name`, `cwd` and `env`.
+- The tab marked `focus` gets the keyboard; otherwise the first tab does.
+
+**Folders and environment:**
+- `cwd` values starting with `~/` are in your home folder, absolute ones are used as written, and anything else is relative to the workspace's `cwd`.
+- The workspace's `cwd` is relative to the project folder, or for the user-wide file, to the focused workspace's folder.
+- `env` on the workspace applies to every terminal in it.
+- `setup` runs in the first terminal before its command.
+
+**`restart`** decides what happens when a workspace with that name already exists:
+- `new` (the default) opens another one;
+- `confirm` asks, then replaces it;
+- `recreate` replaces it straight away;
+- `ignore` switches to it.
+
+Replacing ends the old workspace's shells.
+
+**How it's built:** the window builds the workspace step by step: new workspace, splits, tabs, names, divider positions. The session has no per-terminal environment, and no start folder for split panes. So each terminal gets a short line typed into its shell first, `cd` to its folder and `export` its variables, followed by `clear`. A leading space keeps that line out of shell history. Then come `setup` and the command.
+
+**Not supported:** the workspace `color`, because the session has no workspace colours.
+
+**Errors:** an entry with a mistake (a split without exactly two children, a browser without a `url`) is skipped, and listed at the top of the palette with the reason.
 
 The TUI's own `commands` (from `~/.config/cmux/cmux-tui.json`) are listed too, and run as a new tab the way the TUI runs them. **Quit session** asks first.
 
