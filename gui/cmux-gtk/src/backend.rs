@@ -42,6 +42,8 @@ const TREE_POLL: Duration = Duration::from_millis(1500);
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {
     pub id: u64,
+    /// The stable id (`ws_…`), which survives a session restart.
+    pub resource_id: Option<String>,
     pub name: String,
     pub active: bool,
     /// Title of the active pane's active tab, for the sidebar subtitle.
@@ -214,6 +216,12 @@ pub enum UiMsg {
     /// A workspace layout command finished building workspace `name`: the
     /// tab to focus, or why it failed.
     LayoutBuilt { name: String, focus: Option<u64>, error: Option<String> },
+    /// A pane moved to another workspace: its active tab to show, or why it
+    /// failed.
+    PaneMoved { focus: Option<u64>, error: Option<String> },
+    /// The DevTools front-end URL for the browser tab in `pane`, or why
+    /// there's none.
+    DevTools { pane: u64, result: Result<String, String> },
     /// Workspace details (directory, git branch, listening ports) changed.
     Meta(std::collections::HashMap<u64, crate::meta::WsMeta>),
     /// Output for the attachment with this `generation` (unique across all
@@ -914,6 +922,7 @@ fn parse_workspaces(tree: &Value) -> Vec<Workspace> {
                 .unwrap_or_default();
             Workspace {
                 id: ws.get("id").and_then(Value::as_u64).unwrap_or(0),
+                resource_id: ws.get("resource_id").and_then(Value::as_str).map(str::to_string),
                 name: ws.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                 active: ws.get("active").and_then(Value::as_bool).unwrap_or(false),
                 title,

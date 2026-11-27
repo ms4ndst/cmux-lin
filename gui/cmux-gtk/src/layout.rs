@@ -381,6 +381,101 @@ impl Builder<'_> {
     }
 }
 
+/// Move a whole pane: its tabs, in order, into a new pane in workspace
+/// `target` (split off that workspace's active pane), or into a new
+/// workspace named `name` when `target` is `None`. Terminals and browsers
+/// keep running; the emptied pane closes. The UI gets
+/// [`UiMsg::PaneMoved`] with the moved active tab to show.
+pub fn spawn_move_pane(
+    socket_path: PathBuf,
+    tabs: Vec<u64>,
+    active: Option<u64>,
+    target: Option<u64>,
+    name: String,
+    ui: async_channel::Sender<UiMsg>,
+) {
+    std::thread::spawn(move || {
+        let result = Conn::connect(&socket_path).and_then(|mut conn| move_pane(&mut conn, &tabs, target, &name));
+        let message = match result {
+            Ok(()) => UiMsg::PaneMoved { focus: active.or(tabs.first().copied()), error: None },
+            Err(error) => UiMsg::PaneMoved { focus: None, error: Some(error) },
+        };
+        let _ = ui.send_blocking(message);
+    });
+}
+
+fn move_pane(conn: &mut Conn, tabs: &[u64], target: Option<u64>, name: &str) -> Result<(), String> {
+    let mut builder = Builder { conn, setup: None, focus: None, first: None };
+    // A pane to receive the tabs, and the placeholder terminal it came with.
+    let placeholder = match target {
+        None => {
+            let made = builder.conn.request(json!({ "cmd": "new-workspace", "name": name }))?;
+            made.get("surface").and_then(Value::as_u64).ok_or("new-workspace returned no tab")?
+        }
+        Some(workspace) => {
+            let tree = builder.tree()?;
+            let ws = tree
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|w| w.get("id").and_then(Value::as_u64) == Some(workspace))
+                .ok_or("that workspace is gone")?;
+            let screen = ws
+                .get("screens")
+                .and_then(Value::as_array)
+                .and_then(|screens| screens.iter().find(|s| s.get("active") == Some(&Value::Bool(true))).or(screens.first()))
+                .ok_or("that workspace has no screen")?;
+            let anchor = screen
+                .get("active_pane")
+                .and_then(Value::as_u64)
+                .or_else(|| screen.pointer("/panes/0/id").and_then(Value::as_u64))
+                .ok_or("that workspace has no pane")?;
+            let made = builder.conn.request(json!({ "cmd": "split", "pane": anchor, "dir": "right" }))?;
+            made.get("surface").and_then(Value::as_u64).ok_or("split returned no tab")?
+        }
+    };
+    let pane = builder.pane_of(placeholder)?;
+    for (index, surface) in tabs.iter().enumerate() {
+        builder.conn.request(json!({ "cmd": "move-tab", "surface": surface, "pane": pane, "index": index }))?;
+    }
+    let terminal = builder.terminal_of(placeholder)?;
+    builder.conn.request(json!({ "cmd": "close-surface", "surface": placeholder }))?;
+    if let Some(terminal) = terminal {
+        let _ = builder.conn.request(json!({ "cmd": "close-terminal", "terminal_id": terminal }));
+    }
+    Ok(())
+}
+
+/// Open `url` as a browser tab named `name` in a new pane split off to the
+/// right of `pane` (used for DevTools beside its page). The UI gets a status
+/// line either way.
+pub fn spawn_side_browser(socket_path: PathBuf, pane: u64, url: String, name: String, ui: async_channel::Sender<UiMsg>) {
+    std::thread::spawn(move || {
+        let result = Conn::connect(&socket_path).and_then(|mut conn| {
+            let mut builder = Builder { conn: &mut conn, setup: None, focus: None, first: None };
+            let made = builder.conn.request(json!({ "cmd": "split", "pane": pane, "dir": "right" }))?;
+            let placeholder = made.get("surface").and_then(Value::as_u64).ok_or("split returned no tab")?;
+            let new_pane = builder.pane_of(placeholder)?;
+            let made = builder.conn.request(json!({ "cmd": "new-browser-tab", "pane": new_pane, "url": url }))?;
+            if let Some(surface) = made.get("surface").and_then(Value::as_u64) {
+                let _ = builder.conn.request(json!({ "cmd": "rename-surface", "surface": surface, "name": name }));
+            }
+            // The split's own terminal isn't wanted.
+            let terminal = builder.terminal_of(placeholder)?;
+            builder.conn.request(json!({ "cmd": "close-surface", "surface": placeholder }))?;
+            if let Some(terminal) = terminal {
+                let _ = builder.conn.request(json!({ "cmd": "close-terminal", "terminal_id": terminal }));
+            }
+            Ok(())
+        });
+        let text = match result {
+            Ok(()) => format!("Opened {name}"),
+            Err(error) => format!("Couldn't open {name}: {error}"),
+        };
+        let _ = ui.send_blocking(UiMsg::Status(text));
+    });
+}
+
 /// Single-quote for a POSIX shell.
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))

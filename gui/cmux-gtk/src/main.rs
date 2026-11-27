@@ -33,6 +33,7 @@ mod browser;
 mod files;
 mod find;
 mod layout;
+mod machines;
 mod meta;
 mod notes;
 mod palette;
@@ -89,6 +90,7 @@ const CSS: &str = "
 .find-bar { padding: 2px 4px; }
 .pane.flash { box-shadow: inset 0 0 0 3px @accent_color; }
 .ws-details { opacity: 0.85; }
+.ws-description { font-style: italic; opacity: 0.9; }
 .palette { padding: 6px; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.45); background-color: @window_bg_color; }
 .palette list { background: transparent; }
 .palette list row:selected { background-color: alpha(@accent_color, 0.25); color: inherit; }
@@ -225,10 +227,17 @@ struct State {
     meta_targets: meta::Targets,
     /// A tab a just-built workspace layout wants shown, once the tree has it.
     pending_focus: Option<u64>,
+    /// For a moved pane: the workspace it left (wait until the tab is
+    /// elsewhere, ignoring trees read mid-move).
+    pending_not_in: Option<u64>,
     /// The window's settings (`~/.config/cmux-lin/gtk.json`), and the
     /// settings window while it's open.
     settings: settings::Settings,
     settings_window: glib::WeakRef<gtk::Window>,
+    /// This session's name, and its workspace descriptions by stable
+    /// workspace id (kept by the window: the session has no such field).
+    session: String,
+    descriptions: HashMap<String, String>,
 }
 
 impl State {
@@ -330,7 +339,17 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let main_menu = gtk::MenuButton::new();
     main_menu.set_icon_name("open-menu-symbolic");
     main_menu.set_tooltip_text(Some("Menu"));
-    main_menu.set_menu_model(Some(&build_main_menu()));
+    let sessions_menu = gio::Menu::new();
+    let main_model = build_main_menu(&sessions_menu);
+    main_menu.set_menu_model(Some(&main_model));
+    // The session list is read each time the menu opens.
+    main_menu.set_create_popup_func({
+        let session = session.to_string();
+        move |button| {
+            fill_sessions_menu(&sessions_menu, &session);
+            button.set_menu_model(Some(&main_model));
+        }
+    });
     header.pack_end(&main_menu);
     // Notification panel; its requests are wired up once the state exists.
     let notes_host_slot: Rc<RefCell<Option<notes::Host>>> = Rc::new(RefCell::new(None));
@@ -400,16 +419,29 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     }));
 
+    // Machines view; its requests are wired up once the state exists.
+    let machines_host_slot: Rc<RefCell<Option<machines::Host>>> = Rc::new(RefCell::new(None));
+    let machines_view = machines::MachinesView::new(Rc::new({
+        let slot = machines_host_slot.clone();
+        move |target| {
+            let host = slot.borrow().clone();
+            if let Some(host) = host {
+                host(target);
+            }
+        }
+    }));
+
     let sidebar_stack = gtk::Stack::new();
     sidebar_stack.add_titled(&workspaces_page, Some("workspaces"), "Workspaces");
     sidebar_stack.add_titled(&files_view.root, Some("files"), "Files");
+    sidebar_stack.add_titled(&machines_view.root, Some("machines"), "SSH");
     sidebar_stack.set_vexpand(true);
     let switcher = gtk::StackSwitcher::new();
     switcher.set_stack(Some(&sidebar_stack));
     switcher.set_margin_start(4);
     switcher.set_margin_end(4);
     switcher.set_margin_top(4);
-    switcher.set_tooltip_text(Some("Workspaces / Files (Ctrl+Shift+Y)"));
+    switcher.set_tooltip_text(Some("Workspaces / Files / SSH (Ctrl+Shift+Y)"));
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 2);
     sidebar.add_css_class("cmux-sidebar");
     sidebar.set_width_request(200);
@@ -515,8 +547,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
         meta: HashMap::new(),
         meta_targets: meta_targets.clone(),
         pending_focus: None,
+        pending_not_in: None,
         settings: initial_settings.clone(),
         settings_window: glib::WeakRef::new(),
+        session: session.to_string(),
+        descriptions: load_descriptions(session),
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -563,6 +598,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
             notes::Request::ReadAll => mark_all_read(&state),
             notes::Request::ClearAll => state.borrow().send(Ctl::NotesClear),
         }
+    }));
+
+    *machines_host_slot.borrow_mut() = Some(Rc::new({
+        let state = state.clone();
+        move |target: String| connect_ssh(&state, &target)
     }));
 
     agents_list.connect_row_activated({
@@ -728,9 +768,29 @@ fn build_ui(app: &gtk::Application, session: &str) {
                             Some(error) => ui.status.set_text(&format!("Couldn't build workspace “{name}”: {error}")),
                             None => ui.status.set_text(&format!("Opened workspace “{name}”")),
                         }
+                        {
+                            let mut st = state.borrow_mut();
+                            st.pending_focus = focus;
+                            st.pending_not_in = None;
+                        }
+                        state.borrow().send(Ctl::Poke);
+                    }
+                    UiMsg::PaneMoved { focus, error } => {
+                        match error {
+                            Some(error) => ui.status.set_text(&format!("Couldn't move the pane: {error}")),
+                            None => ui.status.set_text("Moved the pane"),
+                        }
                         state.borrow_mut().pending_focus = focus;
                         state.borrow().send(Ctl::Poke);
                     }
+                    UiMsg::DevTools { pane, result } => match result {
+                        Ok(url) => {
+                            let st = state.borrow();
+                            ui.status.set_text("Opening DevTools…");
+                            layout::spawn_side_browser(st.socket_path.clone(), pane, url, "DevTools".into(), st.ui_tx.clone());
+                        }
+                        Err(error) => ui.status.set_text(&format!("No DevTools for this tab: {error}")),
+                    },
                     UiMsg::Meta(meta) => {
                         state.borrow_mut().meta = meta;
                         draw_sidebar(&state, &ui);
@@ -749,6 +809,14 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     });
 
+    // Remember this window for ☰ → Sessions → Reopen closed window.
+    window.connect_close_request({
+        let session = session.to_string();
+        move |_| {
+            note_closed_window(&session);
+            glib::Propagation::Proceed
+        }
+    });
     window.connect_close_request({
         let state = state.clone();
         move |_| {
@@ -790,8 +858,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     toggle_files.connect_activate({
         let ui = ui.clone();
         move |_, _| {
-            let next = if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") { "workspaces" } else { "files" };
-            ui.sidebar_stack.set_visible_child_name(next);
+            ui.sidebar_stack.set_visible_child_name(next_sidebar_view(&ui));
         }
     });
     app.add_action(&toggle_files);
@@ -809,7 +876,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
             let Some(row) = list.row_at_y(y as i32) else { return };
             let Some(ws) = state.borrow().workspaces.get(row.index() as usize).map(|w| w.id) else { return };
             let model = gio::Menu::new();
-            for (label, action) in [("Rename…", "app.rename-workspace"), ("Close workspace…", "app.close-workspace")] {
+            for (label, action) in [
+                ("Rename…", "app.rename-workspace"),
+                ("Edit description…", "app.describe-workspace"),
+                ("Close workspace…", "app.close-workspace"),
+            ] {
                 let item = gio::MenuItem::new(Some(label), None);
                 item.set_action_and_target_value(Some(action), Some(&ws.to_variant()));
                 model.append_item(&item);
@@ -990,6 +1061,244 @@ fn stop_provider(state: &Shared) {
     drop(handle); // outside the borrow: it waits for the provider thread
 }
 
+/// Move pane `pane` (all its tabs) to workspace `target`, or to a new
+/// workspace when `None`.
+fn move_pane(state: &Shared, pane: u64, target: Option<u64>) {
+    let st = state.borrow();
+    let Some(found) = st.raw.iter().flat_map(|ws| ws.screens.iter().flat_map(|s| &s.panes)).find(|p| p.id == pane) else { return };
+    let tabs: Vec<u64> = found.tabs.iter().map(|t| t.surface).collect();
+    let active = found.active().map(|t| t.surface);
+    // A name you gave the tab, else the workspace it came from.
+    let source_name = st
+        .raw
+        .iter()
+        .find(|ws| ws.screens.iter().any(|s| s.panes.iter().any(|p| p.id == pane)))
+        .map(|ws| ws.name.clone())
+        .filter(|n| !n.is_empty());
+    let name = found
+        .active()
+        .and_then(|t| t.name.clone())
+        .filter(|n| !n.is_empty())
+        .or(source_name)
+        .unwrap_or_else(|| "moved pane".to_string());
+    if let Some(ui) = &st.ui {
+        ui.status.set_text("Moving the pane…");
+    }
+    let source = st.raw.iter().find(|ws| ws.screens.iter().any(|s| s.panes.iter().any(|p| p.id == pane))).map(|ws| ws.id);
+    layout::spawn_move_pane(st.socket_path.clone(), tabs, active, target, name, st.ui_tx.clone());
+    drop(st);
+    state.borrow_mut().pending_not_in = source;
+}
+
+/// Saved and running sessions: (name, running), running first, then by name.
+fn known_sessions() -> Vec<(String, bool)> {
+    let mut names: Vec<String> = Vec::new();
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    if let Some(dir) = state.map(|s| s.join("cmux-tui/sessions")) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let file = entry.file_name().to_string_lossy().into_owned();
+            // `<name>-<16 hex digits>`; skip the server's own folders.
+            let Some((name, id)) = file.rsplit_once('-') else { continue };
+            if id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()) && name != "terminal-hosts" && !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    let running: HashSet<String> = runtime_socket_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".sock").map(str::to_string))
+        .collect();
+    names.extend(running.iter().cloned());
+    names.sort();
+    names.dedup();
+    let mut sessions: Vec<(String, bool)> = names.into_iter().map(|n| { let r = running.contains(&n); (n, r) }).collect();
+    sessions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    sessions
+}
+
+/// Where running sessions' sockets are (`$XDG_RUNTIME_DIR/cmux-tui-<uid>`).
+fn runtime_socket_dir() -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+    let uid = std::fs::metadata("/proc/self").ok().map(|m| std::os::unix::fs::MetadataExt::uid(&m))?;
+    Some(runtime.join(format!("cmux-tui-{uid}")))
+}
+
+/// The windows closed most recently, newest first.
+fn closed_windows_path() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(state.join("cmux-lin/closed-windows"))
+}
+
+fn closed_windows() -> Vec<String> {
+    closed_windows_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn note_closed_window(session: &str) {
+    let Some(path) = closed_windows_path() else { return };
+    let mut list = closed_windows();
+    list.retain(|s| s != session);
+    list.insert(0, session.to_string());
+    list.truncate(10);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, list.join("\n") + "\n");
+}
+
+/// Refill ☰ → Sessions: reopen the last closed window, then every session.
+fn fill_sessions_menu(menu: &gio::Menu, own: &str) {
+    menu.remove_all();
+    let reopen = gio::Menu::new();
+    if let Some(last) = closed_windows().into_iter().find(|s| s != own) {
+        let item = gio::MenuItem::new(Some(&format!("Reopen closed window: {last}")), None);
+        item.set_action_and_target_value(Some("app.open-session"), Some(&last.to_variant()));
+        reopen.append_item(&item);
+    }
+    menu.append_section(None, &reopen);
+    let all = gio::Menu::new();
+    for (name, running) in known_sessions() {
+        let label = match (name == own, running) {
+            (true, _) => format!("{name} (this window)"),
+            (false, true) => format!("{name} (running)"),
+            (false, false) => name.clone(),
+        };
+        let item = gio::MenuItem::new(Some(&label), None);
+        item.set_action_and_target_value(Some("app.open-session"), Some(&name.to_variant()));
+        all.append_item(&item);
+    }
+    menu.append_section(None, &all);
+}
+
+/// The sidebar view after the shown one: Workspaces → Files → SSH.
+fn next_sidebar_view(ui: &Ui) -> &'static str {
+    match ui.sidebar_stack.visible_child_name().as_deref() {
+        Some("workspaces") => "files",
+        Some("files") => "machines",
+        _ => "workspaces",
+    }
+}
+
+/// Open a new workspace named after `target` whose terminal runs
+/// `ssh <target>`.
+fn connect_ssh(state: &Shared, target: &str) {
+    if !machines::valid_target(target) {
+        return;
+    }
+    machines::note_recent(target);
+    // Typed into an ordinary shell, so the terminal stays when ssh ends (or
+    // fails): you see why, and you're back in a local shell.
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let spec = layout::Spec {
+        name: target.to_string(),
+        setup: None,
+        layout: layout::Node::Pane(vec![layout::Surface {
+            browser: false,
+            name: Some(target.to_string()),
+            focus: true,
+            command: Some(format!("ssh {target}")),
+            url: None,
+            cwd: home,
+            env: Vec::new(),
+        }]),
+        restart: layout::Restart::New,
+    };
+    let st = state.borrow();
+    if let Some(ui) = &st.ui {
+        ui.status.set_text(&format!("Connecting to {target}…"));
+    }
+    layout::spawn_build(st.socket_path.clone(), spec, st.ui_tx.clone());
+}
+
+/// Start `cmux-gtk --session NAME` (this same program) for another session.
+fn open_session_window(name: &str) -> Result<(), String> {
+    let program = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(program)
+        .args(["--session", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Where workspace descriptions are kept: one file, by session name, then
+/// by stable workspace id.
+fn descriptions_path() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(state.join("cmux-lin/workspace-descriptions.json"))
+}
+
+fn load_descriptions(session: &str) -> HashMap<String, String> {
+    descriptions_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|all| all.get(session).and_then(Value::as_object).cloned())
+        .map(|map| map.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
+        .unwrap_or_default()
+}
+
+/// Save this session's descriptions, keeping other sessions' as they are.
+fn save_descriptions(session: &str, descriptions: &HashMap<String, String>) {
+    let Some(path) = descriptions_path() else { return };
+    let mut all = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    all[session] = json!(descriptions);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&all).unwrap_or_default()));
+}
+
+/// Edit workspace `ws_id`'s description in a popover on its sidebar row.
+/// An empty description removes it.
+fn describe_workspace(state: &Shared, ui: &Ui, ws_id: u64) {
+    let (index, key, current) = {
+        let st = state.borrow();
+        let Some(index) = st.workspaces.iter().position(|w| w.id == ws_id) else { return };
+        let Some(key) = st.workspaces[index].resource_id.clone() else {
+            ui.status.set_text("This session can't keep workspace descriptions (no stable workspace ids)");
+            return;
+        };
+        let current = st.descriptions.get(&key).cloned().unwrap_or_default();
+        (index, key, current)
+    };
+    let Some(row) = ui.list.row_at_index(index as i32) else { return };
+    let (state, ui2) = (state.clone(), ui.clone());
+    text_popover(&ui.list, &row, &current, "What this workspace is for (empty to remove)", 36, move |text| {
+        let text = text.trim().to_string();
+        {
+            let mut st = state.borrow_mut();
+            if text.is_empty() {
+                st.descriptions.remove(&key);
+            } else {
+                st.descriptions.insert(key.clone(), text);
+            }
+            let session = st.session.clone();
+            save_descriptions(&session, &st.descriptions);
+        }
+        draw_sidebar(&state, &ui2);
+    });
+}
+
 /// Open the settings window, or bring it up if it's open.
 fn open_settings(state: &Shared, ui: &Ui) {
     if let Some(window) = state.borrow().settings_window.upgrade() {
@@ -1014,6 +1323,7 @@ fn open_settings(state: &Shared, ui: &Ui) {
         theme: current_theme(),
         text_scale: state.borrow().font_scale,
         files,
+        cookie_sources: provider::cookies::sources().into_iter().map(|s| s.label).collect(),
     };
     let host: settings::Host = Rc::new({
         let (state, ui) = (state.clone(), ui.clone());
@@ -1026,6 +1336,11 @@ fn open_settings(state: &Shared, ui: &Ui) {
                 }
             }
             settings::Request::TextScale(scale) => set_font_scale(&state, &ui, scale),
+            settings::Request::ImportCookies(index) => {
+                if let Some(source) = provider::cookies::sources().into_iter().nth(index) {
+                    import_cookies(&state, &ui, source);
+                }
+            }
             settings::Request::ReloadConfig => {
                 state.borrow().send(Ctl::request(json!({ "cmd": "reload-config" })));
                 ui.status.set_text("Asked the session to reload its config");
@@ -1036,6 +1351,26 @@ fn open_settings(state: &Shared, ui: &Ui) {
     let window = settings::window(&parent, initial, context, host);
     state.borrow_mut().settings_window = window.downgrade();
     window.present();
+}
+
+/// Import a browser profile's cookies into the provider's browser, off the
+/// UI thread (it reads a database and may wait for the keyring).
+fn import_cookies(state: &Shared, ui: &Ui, source: provider::cookies::Source) {
+    let st = state.borrow();
+    let (socket, ui_tx) = (st.socket_path.clone(), st.ui_tx.clone());
+    ui.status.set_text(&format!("Importing cookies from {}…", source.label));
+    std::thread::spawn(move || {
+        let text = match provider::cookies::import(&socket, &source) {
+            Ok((0, 0)) => format!("{} has no cookies to import", source.label),
+            Ok((count, 0)) => format!("Imported {count} cookies from {}", source.label),
+            Ok((count, failed)) => format!(
+                "Imported {count} cookies from {}; {failed} couldn't be decrypted (is the keyring unlocked?)",
+                source.label
+            ),
+            Err(error) => format!("Couldn't import cookies from {}: {error}", source.label),
+        };
+        let _ = ui_tx.send_blocking(UiMsg::Status(text));
+    });
 }
 
 /// Settings changed in the settings window: apply what differs.
@@ -1049,6 +1384,14 @@ fn apply_settings(state: &Shared, ui: &Ui, new: settings::Settings) {
     }
     if old.sidebar_details != new.sidebar_details {
         draw_sidebar(state, ui);
+    }
+    if old.pull_requests != new.pull_requests {
+        let targets = state.borrow().meta_targets.clone();
+        if let Ok(mut targets) = targets.lock() {
+            for target in targets.iter_mut() {
+                target.pr = new.pull_requests;
+            }
+        }
     }
     if old.browser != new.browser || old.browser_provider != new.browser_provider {
         provider::set_browser((!new.browser.is_empty()).then(|| PathBuf::from(&new.browser)));
@@ -1179,7 +1522,7 @@ fn current_theme() -> String {
 
 /// "sw-nord-dark" → "Sw nord dark"-style labels aren't nicer than the names
 /// people type with `cmux-theme set`, so the menu shows the names as is.
-fn build_main_menu() -> gio::Menu {
+fn build_main_menu(sessions: &gio::Menu) -> gio::Menu {
     let menu = gio::Menu::new();
     let themes = gio::Menu::new();
     for name in installed_themes() {
@@ -1191,7 +1534,7 @@ fn build_main_menu() -> gio::Menu {
     look.append(Some("Command palette (Ctrl+Shift+P)"), Some("app.palette"));
     look.append(Some("Settings… (Ctrl+,)"), Some("app.settings"));
     look.append_submenu(Some("Theme"), &themes);
-    look.append(Some("Workspaces / Files (Ctrl+Shift+Y)"), Some("app.toggle-files"));
+    look.append(Some("Sidebar: next view (Ctrl+Shift+Y)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
     let text = gio::Menu::new();
     text.append(Some("Find in terminal (Ctrl+Shift+F)"), Some("app.find"));
@@ -1207,8 +1550,10 @@ fn build_main_menu() -> gio::Menu {
     menu.append_section(None, &notifications);
     let workspace = gio::Menu::new();
     workspace.append(Some("Start session"), Some("app.start-session"));
+    workspace.append_submenu(Some("Sessions"), sessions);
     workspace.append(Some("New workspace"), Some("app.new-workspace"));
     workspace.append(Some("Rename workspace…"), Some("app.rename-this-workspace"));
+    workspace.append(Some("Edit workspace description… (Ctrl+Alt+E)"), Some("app.describe-this-workspace"));
     workspace.append(Some("Close workspace…"), Some("app.close-this-workspace"));
     menu.append_section(None, &workspace);
     menu
@@ -1260,6 +1605,49 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
         }
     });
     app.add_action(&theme);
+
+    // Open a session in its own window (a stopped one starts with its saved
+    // layout); opening this window's own session just raises it.
+    let open_session = gio::SimpleAction::new("open-session", Some(glib::VariantTy::STRING));
+    open_session.connect_activate({
+        let (state, ui, own) = (state.clone(), ui.clone(), session.to_string());
+        move |_, target| {
+            let Some(name) = target.and_then(|t| t.get::<String>()) else { return };
+            if name == own {
+                if let Some(window) = state.borrow().window.upgrade() {
+                    window.present();
+                }
+                return;
+            }
+            match open_session_window(&name) {
+                Ok(()) => ui.status.set_text(&format!("Opening session “{name}”…")),
+                Err(error) => ui.status.set_text(&format!("Couldn't open session “{name}”: {error}")),
+            }
+        }
+    });
+    app.add_action(&open_session);
+
+    // DevTools for the focused browser tab (also F12 and its context menu).
+    let devtools = gio::SimpleAction::new("devtools", None);
+    devtools.connect_activate({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |_, _| {
+            let st = state.borrow();
+            let view = st.target_pane().and_then(|pane| st.panes.get(&pane).map(|v| (pane, v)));
+            match view {
+                Some((pane, view)) if view.browser => {
+                    let Some(tab_id) = view.browser_tab.clone() else { return };
+                    let (socket, ui_tx) = (st.socket_path.clone(), st.ui_tx.clone());
+                    std::thread::spawn(move || {
+                        let result = provider::devtools_url(&socket, &tab_id);
+                        let _ = ui_tx.send_blocking(UiMsg::DevTools { pane, result });
+                    });
+                }
+                _ => ui.status.set_text("DevTools need a browser tab: focus one first"),
+            }
+        }
+    });
+    app.add_action(&devtools);
 
     let open_settings_action = gio::SimpleAction::new("settings", None);
     open_settings_action.connect_activate({
@@ -1382,6 +1770,19 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
             let _ = ctl.send(Ctl::request(json!({ "cmd": "rename-workspace", "workspace": ws_id, "name": name })));
         });
     };
+    for (name, by_id) in [("describe-workspace", true), ("describe-this-workspace", false)] {
+        let action = gio::SimpleAction::new(name, by_id.then_some(glib::VariantTy::UINT64));
+        action.connect_activate({
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_, target| {
+                let ws_id = if by_id { target.and_then(|t| t.get::<u64>()) } else { state.borrow().selected };
+                if let Some(ws_id) = ws_id {
+                    describe_workspace(&state, &ui, ws_id);
+                }
+            }
+        });
+        app.add_action(&action);
+    }
     for (name, by_id) in [("rename-workspace", true), ("rename-this-workspace", false), ("close-workspace", true), ("close-this-workspace", false)] {
         let action = gio::SimpleAction::new(name, by_id.then_some(glib::VariantTy::UINT64));
         let closing = name.starts_with("close");
@@ -1506,8 +1907,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>y", |st, _| {
         let ui = st.borrow().ui.clone();
         if let Some(ui) = ui {
-            let next = if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") { "workspaces" } else { "files" };
-            ui.sidebar_stack.set_visible_child_name(next);
+            ui.sidebar_stack.set_visible_child_name(next_sidebar_view(&ui));
         }
     });
     bind("<Control><Shift>g", |st, pane| {
@@ -1534,6 +1934,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     for (accel, action) in [
         ("<Control><Shift>p", "app.palette"),
         ("<Control>comma", "app.settings"),
+        ("<Control><Alt>e", "app.describe-this-workspace"),
         ("<Control><Shift>i", "app.notifications"),
         ("<Control><Shift>j", "app.jump-unread"),
         ("<Control>plus", "app.font-larger"),
@@ -1720,7 +2121,7 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
                     .filter(|t| t.terminal)
                     .map(|t| t.surface)
                     .or_else(|| terminals.first().copied());
-                meta::Target { workspace: ws.id, primary, surfaces: terminals }
+                meta::Target { workspace: ws.id, primary, surfaces: terminals, pr: st.settings.pull_requests }
             })
             .collect();
         if let Ok(mut current) = st.meta_targets.lock() {
@@ -1733,8 +2134,12 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     // A just-built layout's tab, as soon as the tree has it.
     let pending = state.borrow().pending_focus;
     if let Some(surface) = pending {
-        let built = state.borrow().raw.iter().find(|ws| ws.all_tabs().any(|t| t.surface == surface)).cloned();
+        let built = {
+            let st = state.borrow();
+            st.raw.iter().find(|ws| ws.all_tabs().any(|t| t.surface == surface) && Some(ws.id) != st.pending_not_in).cloned()
+        };
         if let Some(ws) = built {
+            state.borrow_mut().pending_not_in = None;
             {
                 // Its tabs appeared one by one while it was built, and each
                 // came into view as "new"; show the tabs the layout chose.
@@ -1773,7 +2178,8 @@ fn draw_sidebar(state: &Shared, ui: &Ui) {
     let st = state.borrow();
     for ws in &st.workspaces {
         let meta = st.meta.get(&ws.id).filter(|_| st.settings.sidebar_details);
-        ui.list.append(&sidebar_row(ws, &st.agents, meta));
+        let description = ws.resource_id.as_ref().and_then(|id| st.descriptions.get(id)).map(String::as_str);
+        ui.list.append(&sidebar_row(ws, &st.agents, meta, description));
     }
     let target = st.workspaces.iter().position(|w| Some(w.id) == st.selected);
     drop(st);
@@ -2028,6 +2434,23 @@ fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
         }
     }
 
+    // Pull requests of the workspaces that have one.
+    {
+        let st = state.borrow();
+        for ws in &st.workspaces {
+            let Some(pr) = st.meta.get(&ws.id).and_then(|m| m.pr.clone()).filter(|p| !p.url.is_empty()) else { continue };
+            let window = st.window.clone();
+            let url = pr.url.clone();
+            items.push(
+                Item::new(format!("Open pull request #{}: {}", pr.number, pr.title), move || {
+                    gtk::UriLauncher::new(&url).launch(window.upgrade().as_ref(), gio::Cancellable::NONE, |_| {});
+                })
+                .detail(format!("{} · {}", ws.name, pr.state))
+                .keywords("github pr"),
+            );
+        }
+    }
+
     // Window actions.
     items.push(Item::new("New tab", on_pane(|st, pane| st.borrow().send(new_tab(pane)))).shortcut("Ctrl+Shift+T"));
     items.push(
@@ -2086,7 +2509,31 @@ fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
     items.push(Item::new("Next workspace", { let st = state.clone(); move || step_workspace(&st, 1) }).shortcut("Alt+PageDown"));
     items.push(Item::new("Previous workspace", { let st = state.clone(); move || step_workspace(&st, -1) }).shortcut("Alt+PageUp"));
     items.push(Item::new("Flash focused pane", on_pane(flash_pane)).shortcut("Ctrl+Shift+H"));
+    items.push(Item::new("Move pane to a new workspace", on_pane(|st, pane| move_pane(st, pane, None))));
+    {
+        let st = state.borrow();
+        for ws in st.workspaces.iter().filter(|w| Some(w.id) != st.selected) {
+            let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+            let (state, target) = (state.clone(), ws.id);
+            items.push(Item::new(format!("Move pane to workspace: {name}"), move || {
+                let pane = state.borrow().target_pane();
+                if let Some(pane) = pane {
+                    move_pane(&state, pane, Some(target));
+                }
+            }));
+        }
+    }
     items.push(Item::new("Find in terminal", action("find", None)).keywords("search").shortcut("Ctrl+Shift+F"));
+    items.push(Item::new("Developer tools for this browser tab", action("devtools", None)).keywords("inspect devtools console").shortcut("F12"));
+    for source in provider::cookies::sources() {
+        let (state, ui) = (state.clone(), ui.clone());
+        let label = source.label.clone();
+        items.push(
+            Item::new(format!("Import cookies from {label}"), move || import_cookies(&state, &ui, source.clone()))
+                .detail("So browser tabs start logged in")
+                .keywords("browser login session"),
+        );
+    }
     items.push(Item::new("Larger text", action("font-larger", None)).keywords("font zoom bigger").shortcut("Ctrl++"));
     items.push(Item::new("Smaller text", action("font-smaller", None)).keywords("font zoom").shortcut("Ctrl+−"));
     items.push(Item::new("Normal text size", action("font-reset", None)).keywords("font reset").shortcut("Ctrl+0"));
@@ -2094,11 +2541,36 @@ fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
     items.push(Item::new("Jump to latest unread notification", action("jump-unread", None)).shortcut("Ctrl+Shift+J"));
     items.push(Item::new("Mark all notifications read", action("notifications-read", None)));
     items.push(Item::new("Clear all notifications", action("notifications-clear", None)));
-    items.push(Item::new("Toggle sidebar: Workspaces / Files", action("toggle-files", None)).shortcut("Ctrl+Shift+Y"));
+    items.push(Item::new("Sidebar: next view (Workspaces, Files, SSH)", action("toggle-files", None)).shortcut("Ctrl+Shift+Y"));
+    {
+        let mut hosts: Vec<String> = machines::recent();
+        for (host, _) in machines::known_hosts() {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        for host in hosts {
+            let (state, target) = (state.clone(), host.clone());
+            items.push(Item::new(format!("SSH: {host}"), move || connect_ssh(&state, &target)).detail("New workspace running ssh").keywords("remote machine connect"));
+        }
+    }
     items.push(Item::new("New workspace", action("new-workspace", None)));
     items.push(Item::new("Rename workspace…", action("rename-this-workspace", None)));
+    items.push(Item::new("Edit workspace description…", action("describe-this-workspace", None)).keywords("note").shortcut("Ctrl+Alt+E"));
     items.push(Item::new("Close workspace…", action("close-this-workspace", None)).detail("Ends its shells"));
     items.push(Item::new("Start session", action("start-session", None)));
+    {
+        let own = state.borrow().session.clone();
+        if let Some(last) = closed_windows().into_iter().find(|s| *s != own) {
+            items.push(Item::new(format!("Reopen closed window: {last}"), action("open-session", Some(last.to_variant()))).keywords("session restore"));
+        }
+        for (name, running) in known_sessions().into_iter().filter(|(n, _)| *n != own) {
+            items.push(
+                Item::new(format!("Open session: {name}"), action("open-session", Some(name.to_variant())))
+                    .detail(if running { "running" } else { "stopped; starts with its saved layout" }),
+            );
+        }
+    }
     items.push(Item::new("Settings", action("settings", None)).keywords("preferences options font scrollback cursor").shortcut("Ctrl+,"));
 
     // Themes.
@@ -2620,6 +3092,18 @@ fn rename_popover(
     current: &str,
     save: impl Fn(String) + 'static,
 ) {
+    text_popover(host, target, current, "Name (empty for default)", 24, save);
+}
+
+/// A one-line text field in a popover pointing at `target`; Enter saves.
+fn text_popover(
+    host: &impl IsA<gtk::Widget>,
+    target: &impl IsA<gtk::Widget>,
+    current: &str,
+    placeholder: &str,
+    width: i32,
+    save: impl Fn(String) + 'static,
+) {
     let popover = gtk::Popover::new();
     popover.set_parent(host);
     if let Some(bounds) = target.compute_bounds(host) {
@@ -2632,8 +3116,8 @@ fn rename_popover(
     }
     let entry = gtk::Entry::new();
     entry.set_text(current);
-    entry.set_width_chars(24);
-    entry.set_placeholder_text(Some("Name (empty for default)"));
+    entry.set_width_chars(width);
+    entry.set_placeholder_text(Some(placeholder));
     popover.set_child(Some(&entry));
     entry.connect_activate({
         let popover = popover.clone();
@@ -2744,7 +3228,7 @@ fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
     ui.screens.append(&add);
 }
 
-fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>) -> gtk::Box {
+fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>, description: Option<&str>) -> gtk::Box {
     let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
     let title = gtk::Label::new(Some(&name));
     title.set_xalign(0.0);
@@ -2758,6 +3242,17 @@ fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>) -> 
     column.set_margin_bottom(6);
     column.set_margin_start(6);
     column.append(&title);
+    if let Some(description) = description.filter(|d| !d.is_empty()) {
+        let note = gtk::Label::new(Some(description));
+        note.set_xalign(0.0);
+        note.set_wrap(true);
+        note.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        note.set_lines(2);
+        note.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        note.add_css_class("caption");
+        note.add_css_class("ws-description");
+        column.append(&note);
+    }
     column.append(&subtitle);
     column.set_hexpand(true);
     // Git branch and listening ports, when there are any.
@@ -2765,6 +3260,15 @@ fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>) -> 
         let mut parts = Vec::new();
         if let Some(branch) = &meta.branch {
             parts.push(format!("⎇ {branch}"));
+        }
+        if let Some(pr) = &meta.pr {
+            let checks = match pr.checks.as_deref() {
+                Some("pass") => " ✓",
+                Some("fail") => " ✗",
+                Some("pending") => " …",
+                _ => "",
+            };
+            parts.push(format!("#{} {}{checks}", pr.number, pr.state));
         }
         if !meta.ports.is_empty() {
             parts.push(meta.ports.iter().map(|p| format!(":{p}")).collect::<Vec<_>>().join(" "));
@@ -2783,6 +3287,15 @@ fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>) -> 
         }
         if let Some(branch) = &meta.branch {
             tip.push(format!("Branch: {branch}"));
+        }
+        if let Some(pr) = &meta.pr {
+            let checks = match pr.checks.as_deref() {
+                Some("pass") => ", checks passed",
+                Some("fail") => ", checks failing",
+                Some("pending") => ", checks running",
+                _ => "",
+            };
+            tip.push(format!("Pull request #{} ({}{checks}): {}", pr.number, pr.state, pr.title));
         }
         if !meta.ports.is_empty() {
             let ports: Vec<String> = meta.ports.iter().map(u16::to_string).collect();
@@ -3323,6 +3836,13 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
                         let _ = ui_tx.send_blocking(UiMsg::Copied { generation, result, cut });
                     });
                 }
+                browser::HostRequest::DevTools => {
+                    let Some(tab_id) = tab_id else { return };
+                    std::thread::spawn(move || {
+                        let result = provider::devtools_url(&socket, &tab_id);
+                        let _ = ui_tx.send_blocking(UiMsg::DevTools { pane: id, result });
+                    });
+                }
                 browser::HostRequest::OpenInNewTab(url) => {
                     st.send(Ctl::request(json!({ "cmd": "new-browser-tab", "pane": id, "url": url })));
                 }
@@ -3585,6 +4105,10 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
     let manage = gio::Menu::new();
     manage.append(Some("Undo layout change (Ctrl+Shift+U)"), Some("pane.undo"));
     manage.append(Some("Move tab to new workspace"), Some("pane.move-new-workspace"));
+    // Move the whole pane: to another workspace, or a new one.
+    // Filled in each time the menu opens, so new workspaces are there.
+    let destinations = gio::Menu::new();
+    manage.append_submenu(Some("Move pane to workspace"), &destinations);
     manage.append(Some("Rename tab…"), Some("pane.rename"));
     manage.append(Some("Close pane"), Some("pane.close"));
     menu.append_section(None, &manage);
@@ -3593,6 +4117,24 @@ fn draw_tabbar(state: &Shared, tabbar: &gtk::Box, pane: &Pane, marks: &[Option<A
     more.add_css_class("flat");
     more.set_tooltip_text(Some("Pane menu"));
     more.set_menu_model(Some(&menu));
+    more.set_create_popup_func({
+        let state = state.clone();
+        move |button| {
+            destinations.remove_all();
+            if let Ok(st) = state.try_borrow() {
+                for ws in st.workspaces.iter().filter(|w| Some(w.id) != st.selected) {
+                    let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+                    let item = gio::MenuItem::new(Some(&name), None);
+                    item.set_action_and_target_value(Some("pane.move-pane"), Some(&ws.id.to_variant()));
+                    destinations.append_item(&item);
+                }
+            }
+            let new_item = gio::MenuItem::new(Some("New workspace"), None);
+            new_item.set_action_and_target_value(Some("pane.move-pane"), Some(&0u64.to_variant()));
+            destinations.append_item(&new_item);
+            button.set_menu_model(Some(&menu));
+        }
+    });
     tabbar.append(&more);
 }
 
@@ -3661,6 +4203,16 @@ fn install_pane_actions(state: &Shared, root: &gtk::Box, tabbar: &gtk::Box, id: 
         move |_, _| state.borrow().send(Ctl::Undo { pane: id, confirm: None })
     });
     group.add_action(&undo);
+    let move_pane_action = gio::SimpleAction::new("move-pane", Some(glib::VariantTy::UINT64));
+    move_pane_action.connect_activate({
+        let state = state.clone();
+        move |_, target| {
+            let target = target.and_then(|t| t.get::<u64>()).filter(|t| *t != 0);
+            move_pane(&state, id, target);
+        }
+    });
+    group.add_action(&move_pane_action);
+
     let move_new = gio::SimpleAction::new("move-new-workspace", None);
     move_new.connect_activate({
         let (state, send) = (state.clone(), send.clone());

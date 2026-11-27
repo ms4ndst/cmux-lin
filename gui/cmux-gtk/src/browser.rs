@@ -40,6 +40,8 @@ pub enum HostRequest {
     /// Find the link at page point (`page_x`, `page_y`), then call
     /// [`WebView::show_menu`] at widget point (`x`, `y`).
     ContextMenu { x: f64, y: f64, page_x: f64, page_y: f64 },
+    /// Open the browser's developer tools for this page (F12).
+    DevTools,
 }
 
 pub type Host = Rc<dyn Fn(HostRequest)>;
@@ -275,6 +277,8 @@ impl WebView {
                 picture.clipboard().set_text(&url);
             }
         }));
+        let host = self.host.clone();
+        add("devtools", None, Box::new(move |_| host(HostRequest::DevTools)));
         let current = self.url.clone();
         add("open-external", None, Box::new(move |_| {
             let url = current.borrow().clone();
@@ -453,6 +457,10 @@ impl WebView {
                 open_menu();
                 return glib::Propagation::Stop;
             }
+            if key == gdk::Key::F12 {
+                host(HostRequest::DevTools);
+                return glib::Propagation::Stop;
+            }
             let mut modifiers = 0u32;
             if state.contains(gdk::ModifierType::ALT_MASK) {
                 modifiers |= 1;
@@ -591,6 +599,7 @@ fn show_menu(menu: &gtk::PopoverMenu, x: f64, y: f64, link: Option<String>) {
     edit.append(Some("Select all"), Some("web.select-all"));
     model.append_section(None, &edit);
     let page = gio::Menu::new();
+    page.append(Some("Inspect (F12)"), Some("web.devtools"));
     page.append(Some("Open page in default browser"), Some("web.open-external"));
     model.append_section(None, &page);
 

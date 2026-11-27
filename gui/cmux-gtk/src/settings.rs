@@ -27,6 +27,8 @@ pub struct Settings {
     pub desktop_notifications: bool,
     /// The branch and ports line under each workspace.
     pub sidebar_details: bool,
+    /// The branch's pull request in that line (from `gh`).
+    pub pull_requests: bool,
     /// Run the built-in browser provider.
     pub browser_provider: bool,
     /// The browser it uses; empty for automatic.
@@ -44,6 +46,7 @@ impl Default for Settings {
             cursor_blink: true,
             desktop_notifications: true,
             sidebar_details: true,
+            pull_requests: true,
             browser_provider: true,
             browser: String::new(),
             auto_start: true,
@@ -84,6 +87,7 @@ impl Settings {
             ("cursor_blink", &mut settings.cursor_blink),
             ("desktop_notifications", &mut settings.desktop_notifications),
             ("sidebar_details", &mut settings.sidebar_details),
+            ("pull_requests", &mut settings.pull_requests),
             ("browser_provider", &mut settings.browser_provider),
             ("auto_start", &mut settings.auto_start),
         ] {
@@ -106,6 +110,7 @@ impl Settings {
             "cursor_blink": self.cursor_blink,
             "desktop_notifications": self.desktop_notifications,
             "sidebar_details": self.sidebar_details,
+            "pull_requests": self.pull_requests,
             "browser_provider": self.browser_provider,
             "browser": self.browser,
             "auto_start": self.auto_start,
@@ -137,6 +142,8 @@ pub enum Request {
     TextScale(f64),
     /// Ask the session to re-read its config files.
     ReloadConfig,
+    /// Import the cookies of this browser profile (index into the sources).
+    ImportCookies(usize),
 }
 
 pub type Host = Rc<dyn Fn(Request)>;
@@ -148,6 +155,8 @@ pub struct Context {
     pub text_scale: f64,
     /// Config files to offer: label and path.
     pub files: Vec<(String, PathBuf)>,
+    /// Browser profiles cookies can be imported from.
+    pub cookie_sources: Vec<String>,
 }
 
 /// Build the settings window.
@@ -284,6 +293,14 @@ pub fn window(parent: &gtk::ApplicationWindow, initial: Settings, context: Conte
     );
     switch_row(
         &section,
+        "Pull request status",
+        "The branch's GitHub pull request and its checks, from your own gh login",
+        initial.pull_requests,
+        &change,
+        |s, on| s.pull_requests = on,
+    );
+    switch_row(
+        &section,
         "Start the session automatically",
         "When the window opens and the session isn't running (after a reboot)",
         initial.auto_start,
@@ -318,6 +335,30 @@ pub fn window(parent: &gtk::ApplicationWindow, initial: Settings, context: Conte
         }
     });
     row(&section, "Browser", "Automatic prefers Chromium, then Brave and Edge, then Chrome", &browser);
+
+    if context.cookie_sources.is_empty() {
+        let none = gtk::Label::new(Some("No other browser profiles found to import cookies from."));
+        none.add_css_class("dim-label");
+        none.set_xalign(0.0);
+        section.append(&none);
+    } else {
+        let sources = gtk::DropDown::from_strings(&context.cookie_sources.iter().map(String::as_str).collect::<Vec<_>>());
+        let import = gtk::Button::with_label("Import");
+        import.connect_clicked({
+            let (host, sources) = (host.clone(), sources.clone());
+            move |_| host(Request::ImportCookies(sources.selected() as usize))
+        });
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        controls.append(&sources);
+        controls.append(&import);
+        row(
+            &section,
+            "Import cookies",
+            "Copies a browser profile's cookies into browser tabs so you start logged in. Needs a browser tab open; \
+             your keyring may ask to be unlocked.",
+            &controls,
+        );
+    }
 
     // --- Config files -------------------------------------------------
     let section = new_section(&page, "Config files");

@@ -28,13 +28,14 @@ If the session isn't running (after a reboot, say), the window starts it, like p
 
 ## Workspaces, screens and panes
 
-- **Sidebar:** the session's workspaces, with an **Agents** queue below them and a **Files** view one click away (see [Sidebar](#sidebar)). The header's `+` creates a workspace. Right-click a workspace for Rename and Close.
+- **Sidebar:** the session's workspaces, with an **Agents** queue below them, and **Files** and **SSH** views one click away (see [Sidebar](#sidebar)). The header's `+` creates a workspace. Right-click a workspace for Rename, Edit description and Close.
+- **Descriptions:** give a workspace a note on what it's for (right-click → **Edit description…**, ☰, the palette, or `Ctrl+Alt+E`). It shows in italics under the name. The session has no such field, so the window keeps descriptions in `~/.local/state/cmux-lin/workspace-descriptions.json`, by session and stable workspace id.
 - **Screens:** a strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout). Click one to switch, `×` to close it, `+` for a new one. Each screen button shows the most urgent agent badge on that screen.
 - **Splits:** the active screen's split layout is drawn as resizable panes. Dragging a divider moves it in the TUI too, and the other way round.
 - **Tabs:** every pane has a tab strip. Click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down, `⋮` for the pane menu (zoom, swap with a neighbour, rename tab, undo, close pane).
 - **Renaming:** double-click a workspace, screen or tab. An empty name goes back to the default.
 - **Drag and drop:** drag a tab to reorder it, onto another pane's tab strip or body to move it there, onto a workspace in the sidebar to move it to that workspace, or into the empty sidebar space for a new workspace. The terminal or browser keeps running.
-- **Undo:** the pane menu's **Undo layout change** (`Ctrl+Shift+U`) undoes the screen's last split, swap, zoom or resize. An undo that would close panes asks first and says how many. The pane menu also has **Move tab to new workspace**.
+- **Undo:** the pane menu's **Undo layout change** (`Ctrl+Shift+U`) undoes the screen's last split, swap, zoom or resize. An undo that would close panes asks first and says how many. The pane menu also has **Move tab to new workspace**, and **Move pane to workspace ▸**, which moves the whole pane (every tab, in order, as one pane) to another workspace or a new one. The terminals and browsers keep running. The window follows the pane there. The session has no command for moving a pane, so the window splits the destination's active pane, moves each tab into the new pane, and closes the placeholder shell the split made.
 - **Viewport columns:** screens laid out in columns (the TUI's `Ctrl-b g`, here `Ctrl+Shift+G` or the pane menu's **New column to the right**) show as a horizontally scrolling row. Each column takes its own fraction of the visible width, has its own splits inside, and resizes by dragging its right edge.
 - **Zoom:** a zoomed pane fills its screen (pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom.
 
@@ -180,7 +181,11 @@ The window's settings are saved in `~/.config/cmux-lin/gtk.json`. The theme is s
 
 ## The ☰ menu
 
-**Command palette**, **Settings…**, **Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
+**Command palette**, **Settings…**, **Theme**, the sidebar view, Find and text size, the notification actions, **Start session**, **Sessions ▸**, and New / Rename / Edit description / Close workspace.
+
+### Sessions
+
+☰ → **Sessions** lists every session: the running ones first, then the stopped ones whose layout the session saved. Picking one opens it in its own window, and a stopped session starts again with its saved layout. Picking this window's own session just raises it. **Reopen closed window** at the top brings back the session whose window you closed last. Each window records itself in `~/.local/state/cmux-lin/closed-windows` when it closes. The palette has the same entries (`Open session: …`, `Reopen closed window: …`).
 
 ## Browser tabs
 
@@ -205,9 +210,25 @@ Select text as in any browser: drag, double-click a word, triple-click a line, S
 
 File uploads work as usual: activate a page's file field and the desktop file dialog opens, picking one file or several as the field allows, and the chosen files go to the page. A headless browser can't show a file dialog, so the window intercepts the page's request over DevTools (`Page.setInterceptFileChooserDialog`) and answers it with the files you pick (`DOM.setFileInputFiles`). Cancelling leaves the field empty. Only local files can be uploaded.
 
-Right-click a page for a menu: **Open link in new tab** and **Copy link address** when over a link, then Back, Forward, Reload, Copy, Paste, Select all, and **Open page in default browser** (hands the page to your desktop browser). The Menu key or Shift+F10 opens it from the keyboard. **Shift+right-click** sends the click to the page instead, for sites with their own context menus. The headless browser never shows menus itself, and the window finds the link under the pointer by asking the page over DevTools.
+Right-click a page for a menu: **Open link in new tab** and **Copy link address** when over a link, then Back, Forward, Reload, Copy, Paste, Select all, **Inspect (F12)**, and **Open page in default browser** (hands the page to your desktop browser). The Menu key or Shift+F10 opens it from the keyboard. **Shift+right-click** sends the click to the page instead, for sites with their own context menus. The headless browser never shows menus itself, and the window finds the link under the pointer by asking the page over DevTools.
 
 The page runs in a headless browser whose own clipboard isn't the desktop's, so the window handles the clipboard itself. Copy asks the page for its selection over the DevTools Protocol (the selected part of a focused text field, otherwise the page selection), using the endpoint the provider registered, since the session protocol's `copy` only covers terminals. Paste types the clipboard text into the page. Both are also exposed as the actions `app.browser-copy` and `app.browser-paste`, and the menu as `app.browser-menu`.
+
+### DevTools
+
+`F12` in a browser tab, **Inspect** in its right-click menu, or the palette's **Developer tools** opens the browser's own DevTools for that page in a new pane beside it: Elements, Console, Network, Sources and the rest. It's the DevTools front-end the provider's browser serves on loopback (`http://127.0.0.1:PORT/devtools/inspector.html?ws=…/devtools/page/<target>`), shown in an ordinary browser tab, so it's driven like any other page.
+
+### Importing cookies
+
+So browser tabs start out logged in, Settings → Browser tabs → **Import cookies** (or the palette's `Import cookies from …`) copies the cookies of one of your browser profiles into the provider's browser. It finds the profiles of Chromium, Chrome, Brave, Edge and Vivaldi (Flatpak installs too) and of Firefox.
+
+- The cookie store is read from a temporary copy (owner-only, removed afterwards), so the browser can stay open.
+- Firefox stores values in plain text.
+- Chromium-family browsers encrypt them: `v10` values with a fixed key, `v11` values with a key from the browser's password in your desktop keyring, read with `secret-tool`. The keyring may ask to be unlocked.
+- Expired cookies are skipped.
+- The cookies go into the running browser with DevTools `Storage.setCookies`, so a browser tab has to be open first.
+
+Nothing leaves your machine. Cookies imported this way stay in the provider's profile (`~/.local/share/cmux-lin/browsers/<name>`) until they expire or the site replaces them.
 
 ## Agent attention and notifications
 
@@ -241,10 +262,11 @@ The panel reads the notifications through the session's resource protocol (`noti
 
 ## Sidebar
 
-Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+Y`:
+The sidebar has three views, switched at its top or with `Ctrl+Shift+Y` (it cycles through them):
 
-- **Workspaces**: each row shows the workspace's name, its active tab's title and, when there are any, the git branch of that tab's folder and the TCP ports the workspace's programs listen on (`⎇ main  ·  :3000 :5173`). Hover a row for the full folder. While agents run, the **Agents** queue sits underneath, listing every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
+- **Workspaces**: each row shows the workspace's name, its description, its active tab's title and, when there are any, the git branch of that tab's folder, the branch's pull request, and the TCP ports the workspace's programs listen on (`⎇ main  ·  #42 open ✓  ·  :3000 :5173`). Hover a row for the full folder. While agents run, the **Agents** queue sits underneath, listing every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
 - **Files**: a browser on the focused terminal's working directory, following it as you `cd` (asked from the session with `process-info`) until you navigate yourself; `~` follows again. Double-click or Enter opens a folder, or a file in `$EDITOR` in a new tab. `c` (or the `cd` button) changes the focused pane to the selected folder, `o` opens `.md`/`.html` in a browser tab, `.` shows dotfiles, Backspace goes up, and the field filters by name.
+- **SSH**: other machines to open a workspace on. It lists the hosts in `~/.ssh/config` (and the files it `Include`s, wildcard patterns left out), the SSH machines in the cmux config's `machines`, and the hosts you connected to recently. The field at the top takes any `user@host`. Picking one opens a new workspace named after the host, with `ssh <host>` typed into an ordinary shell. Your SSH config applies (keys, jump hosts, ports), and when ssh ends or fails, the terminal stays with the reason and a local shell. The palette has `SSH: <host>` entries. This is plain SSH in a local terminal, not cmux-tui's remote daemon (`cmux-tui remote`).
 
 ### Branch and ports
 
@@ -253,6 +275,7 @@ The server doesn't track branches or ports, so the window works them out itself 
 - `process-info` gives each terminal's shell process and working folder (the foreground program's, if it reports one).
 - The branch is read from the repository around the active terminal's folder (`.git/HEAD`, worktrees included; a detached head shows its short commit id). No `git` process is run.
 - Ports are the listening TCP sockets (`/proc/net/tcp` and `tcp6`) held by any terminal's shell in the workspace, or by anything started under it. A program that detaches from its shell (a daemon) isn't counted.
+- The pull request comes from GitHub's `gh` CLI: `gh pr view` in that folder, with your own `gh` login. It runs at most once a minute per folder and branch and shows the number, state (open, draft, merged, closed) and checks: ✓ passed, ✗ failing, … running. Hover for the title. The palette's `Open pull request #…` opens it in your browser. Without `gh`, outside a GitHub repository, or with no PR, nothing is shown. Turn it off in Settings.
 
 ## Keyboard shortcuts
 
@@ -278,7 +301,9 @@ They act on the pane you're typing in (the palette, settings, workspace, notific
 | `Ctrl+,` | Settings |
 | `Ctrl+Shift+F` | Find in the terminal |
 | `Ctrl++` / `Ctrl+−` / `Ctrl+0` | Larger / smaller / normal text (every terminal) |
-| `Ctrl+Shift+Y` | Sidebar: Workspaces / Files |
+| `Ctrl+Shift+Y` | Sidebar: next view (Workspaces, Files, SSH) |
+| `Ctrl+Alt+E` | Edit the workspace's description |
+| `F12` | DevTools (in a browser tab) |
 | `Ctrl+Shift+I` | Notification panel |
 | `Ctrl+Shift+J` | Jump to the latest unread notification |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in a terminal pane (also `Shift+Insert`) |
@@ -326,8 +351,8 @@ Terminal colours come from the active theme itself: the `~/.config/ghostty/confi
 
 ## Not done
 
-- moving whole panes between workspaces (tabs move; a pane empties and closes);
-- the TUI's machines view and custom sidebar plugins (`sidebar.plugin`), which need remote machines or a plugin configured on the server.
+- cmux-tui's own remote machines (`cmux-tui remote`, a cmux daemon on the other machine) and custom sidebar plugins (`sidebar.plugin`). The SSH view opens plain SSH sessions instead.
+- the workspace `color` of layout commands (the session has no workspace colours).
 
 ## Debugging
 

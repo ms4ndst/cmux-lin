@@ -12,6 +12,11 @@
 //!   the shell or anything started under it (`/proc/<pid>/fd`). A process
 //!   that detached itself from the shell (daemonized) isn't found.
 //!
+//! - the pull request for that branch comes from GitHub's `gh` CLI
+//!   (`gh pr view` in that directory, with your own `gh` login), at most
+//!   once a minute per directory and branch; without `gh`, or outside a
+//!   GitHub repository, there's simply none.
+//!
 //! Results reach the UI as [`UiMsg::Meta`], only when they change.
 
 use std::collections::{HashMap, HashSet};
@@ -33,6 +38,19 @@ pub struct WsMeta {
     pub branch: Option<String>,
     /// Listening TCP ports of the workspace's terminals, sorted.
     pub ports: Vec<u16>,
+    /// The branch's pull request, if it has one.
+    pub pr: Option<PullRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PullRequest {
+    pub number: u64,
+    /// `open`, `draft`, `merged` or `closed`.
+    pub state: String,
+    /// `pass`, `fail` or `pending`; `None` without checks.
+    pub checks: Option<String>,
+    pub title: String,
+    pub url: String,
 }
 
 /// One workspace to look at: its active terminal (for the directory and
@@ -42,6 +60,8 @@ pub struct Target {
     pub workspace: u64,
     pub primary: Option<u64>,
     pub surfaces: Vec<u64>,
+    /// Look up the branch's pull request.
+    pub pr: bool,
 }
 
 /// The current targets, set by the UI whenever the tree changes.
@@ -53,6 +73,7 @@ pub fn spawn(socket_path: PathBuf, targets: Targets, ui: async_channel::Sender<U
     std::thread::spawn(move || {
         let mut conn: Option<Conn> = None;
         let mut last: Option<HashMap<u64, WsMeta>> = None;
+        let mut prs = PrCache::default();
         loop {
             if ui.is_closed() {
                 return;
@@ -62,7 +83,7 @@ pub fn spawn(socket_path: PathBuf, targets: Targets, ui: async_channel::Sender<U
                 conn = Conn::connect(&socket_path).ok();
             }
             if let Some(c) = conn.as_mut() {
-                match collect(c, &wanted) {
+                match collect(c, &wanted, &mut prs) {
                     Ok(meta) => {
                         if last.as_ref() != Some(&meta) {
                             last = Some(meta.clone());
@@ -81,7 +102,7 @@ pub fn spawn(socket_path: PathBuf, targets: Targets, ui: async_channel::Sender<U
 }
 
 /// One round: details for every target workspace.
-fn collect(conn: &mut Conn, targets: &[Target]) -> Result<HashMap<u64, WsMeta>, String> {
+fn collect(conn: &mut Conn, targets: &[Target], prs: &mut PrCache) -> Result<HashMap<u64, WsMeta>, String> {
     let listening = listening_sockets();
     let children = child_map();
     let mut out = HashMap::new();
@@ -93,6 +114,11 @@ fn collect(conn: &mut Conn, targets: &[Target]) -> Result<HashMap<u64, WsMeta>, 
             pids.push(pid);
             if Some(*surface) == target.primary {
                 meta.branch = cwd.as_deref().and_then(|d| git_branch(Path::new(d)));
+                if target.pr {
+                    if let (Some(dir), Some(branch)) = (cwd.as_deref(), meta.branch.as_deref()) {
+                        meta.pr = prs.get(dir, branch);
+                    }
+                }
                 meta.cwd = cwd;
             }
         }
@@ -109,6 +135,114 @@ fn collect(conn: &mut Conn, targets: &[Target]) -> Result<HashMap<u64, WsMeta>, 
         out.insert(target.workspace, meta);
     }
     Ok(out)
+}
+
+/// Pull requests by (directory, branch), refreshed at most once a minute.
+#[derive(Default)]
+struct PrCache {
+    entries: HashMap<(String, String), (std::time::Instant, Option<PullRequest>)>,
+    /// `gh` isn't installed: stop trying.
+    no_gh: bool,
+}
+
+const PR_REFRESH: Duration = Duration::from_secs(60);
+
+impl PrCache {
+    fn get(&mut self, dir: &str, branch: &str) -> Option<PullRequest> {
+        if self.no_gh {
+            return None;
+        }
+        let key = (dir.to_string(), branch.to_string());
+        if let Some((at, pr)) = self.entries.get(&key) {
+            if at.elapsed() < PR_REFRESH {
+                return pr.clone();
+            }
+        }
+        let pr = match gh_pr_view(dir) {
+            Ok(pr) => pr,
+            Err(GhError::Missing) => {
+                self.no_gh = true;
+                None
+            }
+            Err(GhError::Failed) => None,
+        };
+        self.entries.insert(key, (std::time::Instant::now(), pr.clone()));
+        pr
+    }
+}
+
+enum GhError {
+    Missing,
+    Failed,
+}
+
+/// `gh pr view` for the branch checked out in `dir` (no PR, no GitHub
+/// remote, or not logged in: `Ok(None)`). Gives up after 15 s.
+fn gh_pr_view(dir: &str) -> Result<Option<PullRequest>, GhError> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("gh")
+        .args(["pr", "view", "--json", "number,state,isDraft,title,url,statusCheckRollup"])
+        .current_dir(dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { GhError::Missing } else { GhError::Failed })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GhError::Failed);
+            }
+        }
+    }
+    let output = child.wait_with_output().map_err(|_| GhError::Failed)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let json: Value = serde_json::from_slice(&output.stdout).map_err(|_| GhError::Failed)?;
+    let Some(number) = json.get("number").and_then(Value::as_u64) else { return Ok(None) };
+    let draft = json.get("isDraft").and_then(Value::as_bool).unwrap_or(false);
+    let state = match json.get("state").and_then(Value::as_str).unwrap_or("") {
+        "MERGED" => "merged",
+        "CLOSED" => "closed",
+        _ if draft => "draft",
+        _ => "open",
+    };
+    // Every check's outcome: a failure wins, then anything still running.
+    let mut checks = None;
+    for check in json.get("statusCheckRollup").and_then(Value::as_array).into_iter().flatten() {
+        let outcome = check
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .or_else(|| check.get("state").and_then(Value::as_str))
+            .unwrap_or("");
+        let kind = match outcome {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => "pass",
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => "fail",
+            _ => "pending",
+        };
+        checks = Some(match (checks, kind) {
+            (Some("fail"), _) | (_, "fail") => "fail",
+            (Some("pending"), _) | (_, "pending") => "pending",
+            _ => "pass",
+        });
+    }
+    let text = |key: &str| json.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(Some(PullRequest {
+        number,
+        state: state.to_string(),
+        checks: checks.map(str::to_string),
+        title: text("title"),
+        url: text("url"),
+    }))
 }
 
 /// A plain protocol connection for `process-info`.
