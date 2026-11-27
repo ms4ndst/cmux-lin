@@ -47,7 +47,9 @@ Closing a tab (`×`, `Ctrl+Shift+W`), a pane (pane menu), a screen (`×` on the 
 - Keystrokes and pastes go to the pane you're typing in.
 - Resizing the window or a pane resizes that terminal on the server, so the shell reflows.
 - `Ctrl+Shift+C` copies the selection, and `Ctrl+Shift+V` or `Shift+Insert` pastes. Plain Ctrl+C/V belong to the program running.
-- Right-click opens a menu with Copy, Paste, Select all, New tab, Split right/down and Zoom. Shift+right-click goes to the program instead, for terminal apps that use the mouse.
+- Right-click opens a menu with Copy, Paste, Select all, Find, New tab, Split right/down and Zoom. Shift+right-click goes to the program instead, for terminal apps that use the mouse.
+- **Find** (`Ctrl+Shift+F`) opens a bar above the terminal that searches the scrollback and screen as you type, newest output first. Enter or ↑ goes to the previous (older) match, Shift+Enter or ↓ to the next, wrapping around. **Aa** matches case, and **.\*** treats the text as a regular expression; otherwise it's matched literally. The field turns red when nothing matches. Escape closes the bar and returns to the terminal.
+- **Text size:** `Ctrl++` and `Ctrl+−` make every terminal's text larger or smaller in 10% steps, and `Ctrl+0` resets it. The size is remembered between runs (in `~/.local/state/cmux-lin/gtk-font-scale`), and the shells reflow to the new grid.
 
 ## Themes
 
@@ -59,7 +61,7 @@ Terminal text stays legible in any theme; see [How it works](#how-it-works).
 
 ## The ☰ menu
 
-**Start session**, **Theme**, the Workspaces/Files switch, the notification actions, and New / Rename / Close workspace.
+**Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
 
 ## Browser tabs
 
@@ -120,14 +122,14 @@ The panel reads the notifications through the session's resource protocol (`noti
 
 ## Sidebar
 
-Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+F`:
+Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+Y`:
 
 - **Workspaces**, with the **Agents** queue underneath while agents run: every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
 - **Files**: a browser on the focused terminal's working directory, following it as you `cd` (asked from the session with `process-info`) until you navigate yourself; `~` follows again. Double-click or Enter opens a folder, or a file in `$EDITOR` in a new tab. `c` (or the `cd` button) changes the focused pane to the selected folder, `o` opens `.md`/`.html` in a browser tab, `.` shows dotfiles, Backspace goes up, and the field filters by name.
 
 ## Keyboard shortcuts
 
-They act on the pane you're typing in (the notification keys work anywhere):
+They act on the pane you're typing in (the notification and text size keys work anywhere):
 
 | Keys | Action |
 |---|---|
@@ -140,7 +142,9 @@ They act on the pane you're typing in (the notification keys work anywhere):
 | `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
-| `Ctrl+Shift+F` | Sidebar: Workspaces / Files |
+| `Ctrl+Shift+F` | Find in the terminal |
+| `Ctrl++` / `Ctrl+−` / `Ctrl+0` | Larger / smaller / normal text (every terminal) |
+| `Ctrl+Shift+Y` | Sidebar: Workspaces / Files |
 | `Ctrl+Shift+I` | Notification panel |
 | `Ctrl+Shift+J` | Jump to the latest unread notification |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in a terminal pane (also `Shift+Insert`) |

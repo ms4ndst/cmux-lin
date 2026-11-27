@@ -31,6 +31,7 @@ mod attention;
 mod backend;
 mod browser;
 mod files;
+mod find;
 mod notes;
 mod theme;
 
@@ -81,6 +82,8 @@ const CSS: &str = "
 .browser-bar { padding: 2px 4px; }
 .browser-bar entry { min-height: 0; }
 .notes-count { font-weight: bold; font-size: smaller; }
+.find-bar { padding: 2px 4px; }
+.find-bar entry.error { color: @error_color; }
 ";
 
 /// One pane on screen: its tab strip, its terminal, and the attachment for
@@ -93,6 +96,8 @@ struct PaneView {
     /// Shows `term` for a terminal tab, `web` for a browser tab.
     stack: gtk::Stack,
     term: vte4::Terminal,
+    /// Find in the terminal (Ctrl+Shift+F), above it.
+    find: find::FindBar,
     web: browser::WebView,
     /// Whether the current attachment is a browser tab.
     browser: bool,
@@ -203,6 +208,8 @@ struct State {
     browser_problem: Option<String>,
     /// The session's retained notifications, newest first.
     notes: Vec<backend::Note>,
+    /// Terminal text size, relative to the font (Ctrl+plus / minus / 0).
+    font_scale: f64,
 }
 
 impl State {
@@ -378,7 +385,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     switcher.set_margin_start(4);
     switcher.set_margin_end(4);
     switcher.set_margin_top(4);
-    switcher.set_tooltip_text(Some("Workspaces / Files (Ctrl+Shift+F)"));
+    switcher.set_tooltip_text(Some("Workspaces / Files (Ctrl+Shift+Y)"));
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 2);
     sidebar.add_css_class("cmux-sidebar");
     sidebar.set_width_request(200);
@@ -472,6 +479,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         provider: None,
         browser_problem: None,
         notes: Vec::new(),
+        font_scale: load_font_scale(),
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -737,7 +745,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
 
     // Copy / paste in the focused browser tab, also reachable as actions
     // (menus, D-Bus): `app.browser-copy`, `app.browser-paste`.
-    // Workspaces / Files sidebar view (also Ctrl+Shift+F).
+    // Workspaces / Files sidebar view (also Ctrl+Shift+Y).
     let toggle_files = gio::SimpleAction::new("toggle-files", None);
     toggle_files.connect_activate({
         let ui = ui.clone();
@@ -831,6 +839,73 @@ fn build_ui(app: &gtk::Application, session: &str) {
             }
             glib::ControlFlow::Continue
         });
+    }
+}
+
+/// Open the find bar on the pane shortcuts act on (terminal tabs only),
+/// optionally searching for `text` at once.
+fn open_find(state: &Shared, text: Option<&str>) {
+    let (find, browser, ui) = {
+        let st = state.borrow();
+        let Some(view) = st.target_pane().and_then(|pane| st.panes.get(&pane)) else { return };
+        (view.find.clone(), view.browser, st.ui.clone())
+    };
+    if browser {
+        if let Some(ui) = ui {
+            ui.status.set_text("Find works in terminal tabs");
+        }
+    } else {
+        // After the borrow ends.
+        match text {
+            Some(text) => find.open_with(text),
+            None => find.open(),
+        }
+    }
+}
+
+/// Where the terminal text size is remembered between runs.
+fn font_scale_path() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+    Some(state.join("cmux-lin/gtk-font-scale"))
+}
+
+fn load_font_scale() -> f64 {
+    font_scale_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|scale| (FONT_SCALE_MIN..=FONT_SCALE_MAX).contains(scale))
+        .unwrap_or(1.0)
+}
+
+const FONT_SCALE_MIN: f64 = 0.5;
+const FONT_SCALE_MAX: f64 = 3.0;
+
+/// Make every terminal's text larger (`1`), smaller (`-1`) or normal (`0`),
+/// in steps of 10%, and remember it. The grids shrink or grow, and the
+/// resize timer reports the new sizes, so the shells reflow.
+fn change_font_scale(state: &Shared, ui: &Ui, change: i32) {
+    let scale = {
+        let mut st = state.borrow_mut();
+        let scale = match change {
+            0 => 1.0,
+            n => (st.font_scale * 1.1f64.powi(n) * 100.0).round() / 100.0,
+        };
+        // Snap back to exactly 100% when a step lands close to it.
+        let scale = if (scale - 1.0).abs() < 0.04 { 1.0 } else { scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX) };
+        st.font_scale = scale;
+        for view in st.panes.values() {
+            view.term.set_font_scale(scale);
+        }
+        scale
+    };
+    ui.status.set_text(&format!("Text size {:.0}%", scale * 100.0));
+    if let Some(path) = font_scale_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, format!("{scale}\n"));
     }
 }
 
@@ -960,8 +1035,14 @@ fn build_main_menu() -> gio::Menu {
     }
     let look = gio::Menu::new();
     look.append_submenu(Some("Theme"), &themes);
-    look.append(Some("Workspaces / Files (Ctrl+Shift+F)"), Some("app.toggle-files"));
+    look.append(Some("Workspaces / Files (Ctrl+Shift+Y)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
+    let text = gio::Menu::new();
+    text.append(Some("Find in terminal (Ctrl+Shift+F)"), Some("app.find"));
+    text.append(Some("Larger text (Ctrl++)"), Some("app.font-larger"));
+    text.append(Some("Smaller text (Ctrl+−)"), Some("app.font-smaller"));
+    text.append(Some("Normal text size (Ctrl+0)"), Some("app.font-reset"));
+    menu.append_section(None, &text);
     let notifications = gio::Menu::new();
     notifications.append(Some("Notifications (Ctrl+Shift+I)"), Some("app.notifications"));
     notifications.append(Some("Jump to latest unread (Ctrl+Shift+J)"), Some("app.jump-unread"));
@@ -1023,6 +1104,32 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
         }
     });
     app.add_action(&theme);
+
+    let find = gio::SimpleAction::new("find", None);
+    find.connect_activate({
+        let state = state.clone();
+        move |_, _| open_find(&state, None)
+    });
+    app.add_action(&find);
+    let find_text = gio::SimpleAction::new("find-text", Some(glib::VariantTy::STRING));
+    find_text.connect_activate({
+        let state = state.clone();
+        move |_, target| {
+            let text = target.and_then(|t| t.get::<String>()).unwrap_or_default();
+            open_find(&state, Some(&text));
+        }
+    });
+    app.add_action(&find_text);
+
+    // Terminal text size, for every terminal in the window.
+    for (name, change) in [("font-larger", 1i32), ("font-smaller", -1), ("font-reset", 0)] {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate({
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_, _| change_font_scale(&state, &ui, change)
+        });
+        app.add_action(&action);
+    }
 
     // Notification panel actions (menu, shortcuts, D-Bus).
     let notifications = gio::SimpleAction::new("notifications", None);
@@ -1190,7 +1297,8 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     bind("<Control><Shift>o", |st, pane| st.borrow().send(split(pane, "down")));
     bind("<Control><Shift>b", |st, pane| st.borrow().send(new_browser_tab(pane)));
     bind("<Control><Shift>u", |st, pane| st.borrow().send(Ctl::Undo { pane, confirm: None }));
-    bind("<Control><Shift>f", |st, _| {
+    bind("<Control><Shift>f", |st, _| open_find(st, None));
+    bind("<Control><Shift>y", |st, _| {
         let ui = st.borrow().ui.clone();
         if let Some(ui) = ui {
             let next = if ui.sidebar_stack.visible_child_name().as_deref() == Some("files") { "workspaces" } else { "files" };
@@ -1218,7 +1326,17 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
         }
     });
     // These work with no pane too.
-    for (accel, action) in [("<Control><Shift>i", "app.notifications"), ("<Control><Shift>j", "app.jump-unread")] {
+    for (accel, action) in [
+        ("<Control><Shift>i", "app.notifications"),
+        ("<Control><Shift>j", "app.jump-unread"),
+        ("<Control>plus", "app.font-larger"),
+        ("<Control>equal", "app.font-larger"),
+        ("<Control>KP_Add", "app.font-larger"),
+        ("<Control>minus", "app.font-smaller"),
+        ("<Control>KP_Subtract", "app.font-smaller"),
+        ("<Control>0", "app.font-reset"),
+        ("<Control>KP_0", "app.font-reset"),
+    ] {
         controller.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string(accel),
             Some(gtk::NamedAction::new(action)),
@@ -2048,6 +2166,8 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     term.set_vexpand(true);
     term.set_scrollback_lines(10_000);
     term.set_font(Some(&gtk::pango::FontDescription::from_string("Monospace 11")));
+    term.set_font_scale(state.borrow().font_scale);
+    let find = find::FindBar::new(&term);
 
     // VTE has no PTY here: `commit` hands us encoded keystrokes and pastes,
     // which go to this pane's attachment.
@@ -2090,9 +2210,9 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     term.add_controller(keys);
 
     let term_actions = gio::SimpleActionGroup::new();
-    for name in ["copy", "paste", "select-all"] {
+    for name in ["copy", "paste", "select-all", "find"] {
         let action = gio::SimpleAction::new(name, None);
-        let term = term.clone();
+        let (term, find) = (term.clone(), find.clone());
         action.connect_activate(move |_, _| match name {
             "copy" => {
                 if term.has_selection() {
@@ -2100,6 +2220,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
                 }
             }
             "paste" => term.paste_clipboard(),
+            "find" => find.open(),
             _ => term.select_all(),
         });
         term_actions.add_action(&action);
@@ -2114,6 +2235,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         edit.append(Some("Copy (Ctrl+Shift+C)"), Some("term.copy"));
         edit.append(Some("Paste (Ctrl+Shift+V)"), Some("term.paste"));
         edit.append(Some("Select all"), Some("term.select-all"));
+        edit.append(Some("Find… (Ctrl+Shift+F)"), Some("term.find"));
         menu.append_section(None, &edit);
         let pane = gio::Menu::new();
         pane.append(Some("New tab"), Some("pane.new-tab"));
@@ -2221,6 +2343,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     install_tab_drop(state, &tabbar, &tabbar, id);
     install_tab_drop(state, &stack, &tabbar, id);
     root.append(&tabbar);
+    root.append(&find.root);
     root.append(&stack);
 
     PaneView {
@@ -2229,6 +2352,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         tabbar,
         stack,
         term,
+        find,
         web,
         browser: false,
         browser_live: false,
