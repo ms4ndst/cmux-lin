@@ -59,9 +59,50 @@ The whole window follows the active cmux theme: the terminal colours, and the wi
 
 Terminal text stays legible in any theme; see [How it works](#how-it-works).
 
+## Command palette
+
+`Ctrl+Shift+P` (or ☰ → **Command palette**) opens a search field over everything you can run:
+
+- your custom commands (below);
+- every workspace and tab, to jump to by name (`Go to workspace: api`, `Go to tab: server`);
+- the window's actions (new tab, splits, zoom, find, text size, notifications, workspace actions and more), each with its shortcut shown on the right;
+- every installed theme.
+
+Type to filter. Every word has to match the name, its description or its keywords, either as written or as scattered letters (`thm lat` finds `Theme: latte-light`), and matches at the start of a name or word rank first. Up/Down or Ctrl+N/P move, Enter or a click runs, Escape closes.
+
+### Custom commands
+
+The palette reads the simple commands from the macOS app's `cmux.json` format:
+
+- the project's `.cmux/cmux.json` (or `cmux.json`), found by searching upward from the focused workspace's folder;
+- `~/.config/cmux/cmux.json` for every project.
+
+A project entry wins over a user-wide one with the same name.
+
+```json
+{
+  "commands": [
+    { "name": "Format changed files", "description": "Prettier on what changed", "keywords": ["lint"],
+      "command": "git diff --name-only main -- '*.ts' | xargs npx prettier --write" },
+    { "name": "Reset local database", "command": "./scripts/db-reset.sh", "confirm": true }
+  ]
+}
+```
+
+Picking one types its `command` into the focused terminal and runs it, so it runs wherever that shell is. Start it with `cd "$(git rev-parse --show-toplevel)" &&` when it needs the repository root. With `"confirm": true` the palette asks first. Commands with a `workspace` layout instead of a `command` aren't supported yet and are left out.
+
+The TUI's own `commands` (from `~/.config/cmux/cmux-tui.json`) are listed too, and run as a new tab the way the TUI runs them. **Quit session** asks first.
+
+Scripts can use the palette as well: `app.palette-text` opens it with a query, and `app.palette-run` runs the best match for one:
+
+```bash
+gdbus call --session --dest dev.cmuxlin.CmuxGtk.main --object-path /dev/cmuxlin/CmuxGtk/main \
+  --method org.gtk.Actions.Activate palette-run '[<"format changed files">]' '{}'
+```
+
 ## The ☰ menu
 
-**Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
+**Command palette**, **Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
 
 ## Browser tabs
 
@@ -137,7 +178,7 @@ The server doesn't track branches or ports, so the window works them out itself 
 
 ## Keyboard shortcuts
 
-They act on the pane you're typing in (the workspace, notification and text size keys work anywhere):
+They act on the pane you're typing in (the palette, workspace, notification and text size keys work anywhere):
 
 | Keys | Action |
 |---|---|
@@ -155,6 +196,7 @@ They act on the pane you're typing in (the workspace, notification and text size
 | `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
+| `Ctrl+Shift+P` | Command palette |
 | `Ctrl+Shift+F` | Find in the terminal |
 | `Ctrl++` / `Ctrl+−` / `Ctrl+0` | Larger / smaller / normal text (every terminal) |
 | `Ctrl+Shift+Y` | Sidebar: Workspaces / Files |

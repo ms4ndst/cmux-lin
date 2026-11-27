@@ -125,6 +125,9 @@ pub fn chrome_css() -> String {
 
     // Popups: menus and popovers.
     rule("window.cmux popover > contents, popover.menu > contents", vec![("background-color", &menu_bg), ("color", &menu_fg)]);
+    rule(".palette", vec![("background-color", &menu_bg), ("color", &menu_fg)]);
+    rule(".palette list row:selected", vec![("background-color", &menu_hover), ("color", &menu_hover_fg)]);
+    rule(".palette entry", vec![("background-color", &input_bg), ("color", &strong)]);
     rule(
         "popover.menu modelbutton:hover, popover.menu modelbutton:selected",
         vec![("background-color", &menu_hover), ("color", &menu_hover_fg)],

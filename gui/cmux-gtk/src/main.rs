@@ -34,6 +34,7 @@ mod files;
 mod find;
 mod meta;
 mod notes;
+mod palette;
 mod theme;
 
 use cmux_browser_provider as provider;
@@ -86,6 +87,9 @@ const CSS: &str = "
 .find-bar { padding: 2px 4px; }
 .pane.flash { box-shadow: inset 0 0 0 3px @accent_color; }
 .ws-details { opacity: 0.85; }
+.palette { padding: 6px; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.45); background-color: @window_bg_color; }
+.palette list { background: transparent; }
+.palette list row:selected { background-color: alpha(@accent_color, 0.25); color: inherit; }
 .find-bar entry.error { color: @error_color; }
 ";
 
@@ -249,6 +253,8 @@ struct Ui {
     files: files::FilesView,
     /// The notification panel behind the header bar's bell.
     notes: notes::NotesPanel,
+    /// The command palette (Ctrl+Shift+P), floating over the window.
+    palette: palette::Palette,
     /// The selected workspace's screens, above the panes.
     screens: gtk::Box,
     content: gtk::Box,
@@ -429,7 +435,12 @@ fn build_ui(app: &gtk::Application, session: &str) {
     paned.set_resize_start_child(false);
     paned.set_shrink_start_child(false);
     paned.set_position(220);
-    window.set_child(Some(&paned));
+    // The command palette floats over everything.
+    let palette = palette::Palette::new();
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&paned));
+    overlay.add_overlay(&palette.root);
+    window.set_child(Some(&overlay));
 
     let ui = Ui {
         list: list.clone(),
@@ -438,6 +449,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         sidebar_stack: sidebar_stack.clone(),
         files: files_view.clone(),
         notes: notes_panel.clone(),
+        palette,
         screens,
         content,
         status: status.clone(),
@@ -1049,6 +1061,7 @@ fn build_main_menu() -> gio::Menu {
         themes.append_item(&item);
     }
     let look = gio::Menu::new();
+    look.append(Some("Command palette (Ctrl+Shift+P)"), Some("app.palette"));
     look.append_submenu(Some("Theme"), &themes);
     look.append(Some("Workspaces / Files (Ctrl+Shift+Y)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
@@ -1119,6 +1132,34 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
         }
     });
     app.add_action(&theme);
+
+    let open_palette = gio::SimpleAction::new("palette", None);
+    open_palette.connect_activate({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |_, _| toggle_palette(&state, &ui)
+    });
+    app.add_action(&open_palette);
+    // Scripting: open with a query, or run the best match for one.
+    for name in ["palette-text", "palette-run"] {
+        let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+        action.connect_activate({
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_, target| {
+                let query = target.and_then(|t| t.get::<String>()).unwrap_or_default();
+                let items = palette_items(&state, &ui);
+                if name == "palette-run" {
+                    match palette::run_best(items, &query) {
+                        Some(label) => ui.status.set_text(&format!("Ran: {label}")),
+                        None => ui.status.set_text(&format!("No palette entry matches “{query}”")),
+                    }
+                } else {
+                    let focus = state.borrow().window.upgrade().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
+                    ui.palette.open_with(items, focus, &query);
+                }
+            }
+        });
+        app.add_action(&action);
+    }
 
     // Navigation by name, for scripts (the keys call the same functions):
     // workspace-N / workspace-next / workspace-prev, tab-N / tab-next /
@@ -1356,6 +1397,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     });
     // These work with no pane too.
     for (accel, action) in [
+        ("<Control><Shift>p", "app.palette"),
         ("<Control><Shift>i", "app.notifications"),
         ("<Control><Shift>j", "app.jump-unread"),
         ("<Control>plus", "app.font-larger"),
@@ -1722,6 +1764,351 @@ fn step_tab(state: &Shared, pane: u64, delta: isize) {
     if let Some(surface) = next {
         choose_tab(state, pane, surface);
     }
+}
+
+/// Open the command palette with everything that can be run right now, or
+/// close it.
+fn toggle_palette(state: &Shared, ui: &Ui) {
+    if ui.palette.is_open() {
+        ui.palette.close();
+        return;
+    }
+    let focus = state.borrow().window.upgrade().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
+    ui.palette.toggle(palette_items(state, ui), focus);
+}
+
+/// The palette's entries: custom commands first (they're what people add a
+/// palette for), then workspaces and tabs, window actions, and themes.
+fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
+    use palette::Item;
+    let mut items = Vec::new();
+    let app = state.borrow().app.upgrade();
+    let action = |name: &'static str, target: Option<glib::Variant>| {
+        let app = app.clone();
+        move || {
+            if let Some(app) = &app {
+                app.activate_action(name, target.as_ref());
+            }
+        }
+    };
+    // On the pane shortcuts act on.
+    let on_pane = |run: fn(&Shared, u64)| {
+        let state = state.clone();
+        move || {
+            let pane = state.borrow().target_pane();
+            if let Some(pane) = pane {
+                run(&state, pane);
+            }
+        }
+    };
+
+    // cmux.json commands (project, then user-wide) and the TUI's commands.
+    let cwd = {
+        let st = state.borrow();
+        st.selected.and_then(|ws| st.meta.get(&ws)).and_then(|m| m.cwd.clone())
+    };
+    let (commands, problems) = custom_commands(cwd.as_deref());
+    for problem in problems {
+        ui.status.set_text(&problem);
+    }
+    for command in commands {
+        let (detail, keywords) = (command.description.clone(), command.keywords.clone());
+        let state = state.clone();
+        let label = command.name.clone();
+        items.push(Item::new(label, move || run_custom(&state, &command)).detail(detail).keywords(keywords));
+    }
+
+    // Workspaces and tabs.
+    {
+        let st = state.borrow();
+        for (index, ws) in st.workspaces.iter().enumerate() {
+            let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+            let state = state.clone();
+            let mut item = Item::new(format!("Go to workspace: {name}"), move || jump_workspace_index(&state, index))
+                .detail(ws.title.clone())
+                .keywords("switch");
+            if index < 8 {
+                item = item.shortcut(&format!("Alt+{}", index + 1));
+            }
+            items.push(item);
+        }
+        for ws in &st.raw {
+            let ws_name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+            for (screen_index, screen) in ws.screens.iter().enumerate() {
+                for tab in screen.panes.iter().flat_map(|p| &p.tabs) {
+                    let title = tab.name.clone().unwrap_or_else(|| tab.title.clone());
+                    let title = if title.is_empty() { "tab".to_string() } else { title };
+                    let place = if ws.screens.len() > 1 {
+                        format!("{ws_name} · screen {}", screen_index + 1)
+                    } else {
+                        ws_name.clone()
+                    };
+                    let (state, ui, surface) = (state.clone(), ui.clone(), tab.surface);
+                    items.push(
+                        Item::new(format!("Go to tab: {title}"), move || show_surface_tab(&state, &ui, surface))
+                            .detail(place)
+                            .keywords(if tab.terminal { "switch terminal" } else { "switch browser" }),
+                    );
+                }
+            }
+        }
+    }
+
+    // Window actions.
+    items.push(Item::new("New tab", on_pane(|st, pane| st.borrow().send(new_tab(pane)))).shortcut("Ctrl+Shift+T"));
+    items.push(
+        Item::new("New browser tab", on_pane(|st, pane| st.borrow().send(new_browser_tab(pane))))
+            .keywords("web url")
+            .shortcut("Ctrl+Shift+B"),
+    );
+    items.push(Item::new("Split right", on_pane(|st, pane| st.borrow().send(split(pane, "right")))).shortcut("Ctrl+Shift+E"));
+    items.push(Item::new("Split down", on_pane(|st, pane| st.borrow().send(split(pane, "down")))).shortcut("Ctrl+Shift+O"));
+    items.push(
+        Item::new(
+            "Close tab",
+            on_pane(|st, pane| {
+                let surface = st.borrow().panes.get(&pane).and_then(|v| v.surface);
+                if let Some(surface) = surface {
+                    close_with_shells(st, Closing::Tab(surface));
+                }
+            }),
+        )
+        .detail("Ends its shell")
+        .shortcut("Ctrl+Shift+W"),
+    );
+    items.push(
+        Item::new(
+            "Zoom / unzoom pane",
+            on_pane(|st, pane| st.borrow().send(Ctl::request(json!({ "cmd": "zoom-pane", "pane": pane, "mode": "toggle" })))),
+        )
+        .shortcut("Ctrl+Shift+Z"),
+    );
+    items.push(
+        Item::new("Undo layout change", on_pane(|st, pane| st.borrow().send(Ctl::Undo { pane, confirm: None })))
+            .shortcut("Ctrl+Shift+U"),
+    );
+    items.push(
+        Item::new(
+            "New column to the right",
+            on_pane(|st, pane| st.borrow().send(Ctl::request(json!({ "cmd": "new-pane-right", "pane": pane })))),
+        )
+        .keywords("viewport")
+        .shortcut("Ctrl+Shift+G"),
+    );
+    items.push(
+        Item::new(
+            "New screen",
+            on_pane(|st, _| {
+                let st = st.borrow();
+                if let Some(ws) = st.workspace() {
+                    st.send(Ctl::request(json!({ "cmd": "new-screen", "workspace": ws.id })));
+                }
+            }),
+        )
+        .shortcut("Ctrl+Shift+N"),
+    );
+    items.push(Item::new("Next screen", on_pane(|st, _| step_screen(st, 1))).shortcut("Ctrl+Shift+PageDown"));
+    items.push(Item::new("Previous screen", on_pane(|st, _| step_screen(st, -1))).shortcut("Ctrl+Shift+PageUp"));
+    items.push(Item::new("Next workspace", { let st = state.clone(); move || step_workspace(&st, 1) }).shortcut("Alt+PageDown"));
+    items.push(Item::new("Previous workspace", { let st = state.clone(); move || step_workspace(&st, -1) }).shortcut("Alt+PageUp"));
+    items.push(Item::new("Flash focused pane", on_pane(flash_pane)).shortcut("Ctrl+Shift+H"));
+    items.push(Item::new("Find in terminal", action("find", None)).keywords("search").shortcut("Ctrl+Shift+F"));
+    items.push(Item::new("Larger text", action("font-larger", None)).keywords("font zoom bigger").shortcut("Ctrl++"));
+    items.push(Item::new("Smaller text", action("font-smaller", None)).keywords("font zoom").shortcut("Ctrl+−"));
+    items.push(Item::new("Normal text size", action("font-reset", None)).keywords("font reset").shortcut("Ctrl+0"));
+    items.push(Item::new("Notifications", action("notifications", None)).keywords("panel bell").shortcut("Ctrl+Shift+I"));
+    items.push(Item::new("Jump to latest unread notification", action("jump-unread", None)).shortcut("Ctrl+Shift+J"));
+    items.push(Item::new("Mark all notifications read", action("notifications-read", None)));
+    items.push(Item::new("Clear all notifications", action("notifications-clear", None)));
+    items.push(Item::new("Toggle sidebar: Workspaces / Files", action("toggle-files", None)).shortcut("Ctrl+Shift+Y"));
+    items.push(Item::new("New workspace", action("new-workspace", None)));
+    items.push(Item::new("Rename workspace…", action("rename-this-workspace", None)));
+    items.push(Item::new("Close workspace…", action("close-this-workspace", None)).detail("Ends its shells"));
+    items.push(Item::new("Start session", action("start-session", None)));
+
+    // Themes.
+    let current = current_theme();
+    for name in installed_themes() {
+        let detail = if name == current { "current theme" } else { "" };
+        items.push(Item::new(format!("Theme: {name}"), action("theme", Some(name.to_variant()))).detail(detail).keywords("colors colours"));
+    }
+    items
+}
+
+/// Show workspace `index` (0-based).
+fn jump_workspace_index(state: &Shared, index: usize) {
+    let ui = state.borrow().ui.clone();
+    if let Some(row) = ui.and_then(|ui| ui.list.row_at_index(index as i32).map(|row| (ui, row))) {
+        row.0.list.select_row(Some(&row.1));
+    }
+}
+
+/// A custom command for the palette.
+struct CustomCommand {
+    name: String,
+    /// Shown under the name (the description, else what it runs).
+    description: String,
+    keywords: String,
+    confirm: bool,
+    what: CustomRun,
+}
+
+enum CustomRun {
+    /// `cmux.json` `command`: typed into the focused terminal and run.
+    Type(String),
+    /// The TUI's `commands[].run`: run as a new tab in the focused pane.
+    Tab { argv: Vec<String>, cwd: Option<String> },
+}
+
+/// The commands from `cmux.json` (the project's `.cmux/cmux.json` or
+/// `cmux.json`, found by searching upward from `cwd`, then
+/// `~/.config/cmux/cmux.json`; a project entry wins over a user-wide one with
+/// the same name) and the TUI config's `commands`. Also returns problems to
+/// report (a file that isn't valid JSON).
+fn custom_commands(cwd: Option<&str>) -> (Vec<CustomCommand>, Vec<String>) {
+    let mut files = Vec::new();
+    if let Some(cwd) = cwd {
+        for dir in std::path::Path::new(cwd).ancestors() {
+            let found = [dir.join(".cmux/cmux.json"), dir.join("cmux.json")].into_iter().find(|f| f.is_file());
+            if let Some(file) = found {
+                files.push(file);
+                break;
+            }
+        }
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(config) = &config {
+        let user = config.join("cmux/cmux.json");
+        if user.is_file() {
+            files.push(user);
+        }
+    }
+
+    let mut commands: Vec<CustomCommand> = Vec::new();
+    let mut problems = Vec::new();
+    for file in files {
+        let shown = file.display().to_string();
+        let json = match std::fs::read_to_string(&file).map_err(|e| e.to_string()).and_then(|t| {
+            serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())
+        }) {
+            Ok(json) => json,
+            Err(error) => {
+                problems.push(format!("{shown}: {error}"));
+                continue;
+            }
+        };
+        for entry in json.get("commands").and_then(Value::as_array).into_iter().flatten() {
+            let Some(name) = entry.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()) else { continue };
+            // Workspace layouts aren't supported here yet; only commands.
+            let Some(command) = entry.get("command").and_then(Value::as_str) else { continue };
+            if commands.iter().any(|c| c.name == name) {
+                continue; // a project entry already defined it
+            }
+            let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+            let keywords = match entry.get("keywords") {
+                Some(Value::Array(words)) => words.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                Some(Value::String(words)) => words.clone(),
+                _ => String::new(),
+            };
+            let description = text("description");
+            commands.push(CustomCommand {
+                name: name.to_string(),
+                description: if description.is_empty() { command.to_string() } else { description },
+                keywords: format!("{keywords} {shown}"),
+                confirm: entry.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                what: CustomRun::Type(command.to_string()),
+            });
+        }
+    }
+
+    // The TUI's own commands (the theme picker's entries are covered by the
+    // palette's theme list).
+    if let Some(path) = theme::config_path() {
+        if let Some(json) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+            for entry in json.get("commands").and_then(Value::as_array).into_iter().flatten() {
+                let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+                if id.is_empty() || id.starts_with("theme_set_") {
+                    continue;
+                }
+                let argv: Vec<String> = entry
+                    .get("run")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                if argv.first().is_none_or(|p| p.is_empty()) {
+                    continue;
+                }
+                let name = entry.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
+                commands.push(CustomCommand {
+                    name,
+                    description: "TUI command, runs in a new tab".to_string(),
+                    keywords: argv.join(" "),
+                    // Stopping the session ends every shell: ask first.
+                    confirm: id == "quit-session",
+                    what: CustomRun::Tab { argv, cwd: entry.get("cwd").and_then(Value::as_str).map(str::to_string) },
+                });
+            }
+        }
+    }
+    (commands, problems)
+}
+
+/// Run a custom command, asking first if it says so.
+fn run_custom(state: &Shared, command: &CustomCommand) {
+    let go = {
+        let state = state.clone();
+        let what = match &command.what {
+            CustomRun::Type(text) => CustomRun::Type(text.clone()),
+            CustomRun::Tab { argv, cwd } => CustomRun::Tab { argv: argv.clone(), cwd: cwd.clone() },
+        };
+        move || {
+            let st = state.borrow();
+            let Some(pane) = st.target_pane() else { return };
+            match &what {
+                CustomRun::Type(text) => {
+                    let terminal = st.panes.get(&pane).filter(|v| !v.browser).and_then(|v| v.attachment.as_ref());
+                    match terminal {
+                        Some(attachment) => attachment.send(format!("{text}\r").as_bytes()),
+                        None => {
+                            if let Some(ui) = &st.ui {
+                                ui.status.set_text("Focus a terminal to run that command");
+                            }
+                        }
+                    }
+                }
+                CustomRun::Tab { argv, cwd } => {
+                    let mut request = json!({ "cmd": "run", "argv": argv, "pane": pane });
+                    if let Some(cwd) = cwd {
+                        request["cwd"] = json!(cwd);
+                    }
+                    st.send(Ctl::request(request));
+                }
+            }
+        }
+    };
+    if !command.confirm {
+        go();
+        return;
+    }
+    let Some(window) = state.borrow().window.upgrade() else { return };
+    let dialog = gtk::AlertDialog::builder()
+        .message(format!("Run “{}”?", command.name))
+        .detail(match &command.what {
+            CustomRun::Type(text) => text.clone(),
+            CustomRun::Tab { argv, .. } => argv.join(" "),
+        })
+        .buttons(["Cancel", "Run"])
+        .cancel_button(0)
+        .default_button(1)
+        .modal(true)
+        .build();
+    glib::spawn_future_local(async move {
+        if let Ok(1) = dialog.choose_future(Some(&window)).await {
+            go();
+        }
+    });
 }
 
 /// Run a navigation by name (`app.nav`).
