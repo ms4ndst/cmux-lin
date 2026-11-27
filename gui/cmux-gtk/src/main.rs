@@ -2028,6 +2028,56 @@ fn split(pane: u64, dir: &str) -> Ctl {
     Ctl::request(json!({ "cmd": "split", "pane": pane, "dir": dir }))
 }
 
+/// Whether a VTE `commit` is VTE answering a query in the output it was fed
+/// (OSC colour reports, DA, DSR/CPR, DECRPM, window reports, DCS replies)
+/// rather than input from the person. The server's own terminal already
+/// answers every query the program sends, so forwarding VTE's copy would hand
+/// the program a second answer, and replaying a pane's history would answer
+/// old queries again: both land in the program as typed text, such as
+/// `0;rgb:3c3c/3838/3636...` in a prompt. VTE answers asynchronously, after
+/// `feed` returns, so the reply is recognised by its shape: each reply comes
+/// as one commit, and keystrokes never take these forms.
+fn is_terminal_reply(text: &str) -> bool {
+    let b = text.as_bytes();
+    // OSC and DCS replies carry a terminator (Alt+] / Alt+P are just 2 bytes).
+    if b.len() > 2 && (b.starts_with(b"\x1b]") || b.starts_with(b"\x1bP")) {
+        return b.ends_with(b"\x07") || b.ends_with(b"\x1b\\");
+    }
+    let Some(body) = text.strip_prefix("\x1b[") else {
+        return false;
+    };
+    let Some(last) = body.chars().last() else {
+        return false;
+    };
+    let params = &body[..body.len() - last.len_utf8()];
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit() || c == b';');
+    match last {
+        // DA1 `?..c`, DA2 `>..c`.
+        'c' => params.strip_prefix('?').or_else(|| params.strip_prefix('>')).is_some_and(digits),
+        // DSR status `0n` (keys never end in `n`).
+        'n' => digits(params),
+        // DECRPM `?..$y` / `..$y`.
+        'y' => params.strip_suffix('$').is_some_and(|p| digits(p.strip_prefix('?').unwrap_or(p))),
+        // Window reports `..t`.
+        't' => digits(params),
+        // Cursor position `row;colR` / DECXCPR `?row;colR`. Modified F3 is
+        // `1;<mod>R` with mod 2..=16, so leave row 1 with such a column alone.
+        'R' => {
+            if let Some(p) = params.strip_prefix('?') {
+                return digits(p);
+            }
+            let mut it = params.split(';');
+            match (it.next(), it.next(), it.next()) {
+                (Some(r), Some(c), None) if digits(r) && digits(c) => {
+                    !(r == "1" && c.parse::<u32>().is_ok_and(|m| (2..=16).contains(&m)))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn grid(term: &vte4::Terminal) -> (u16, u16) {
     let cols = term.column_count().clamp(0, i64::from(u16::MAX)) as u16;
     let rows = term.row_count().clamp(0, i64::from(u16::MAX)) as u16;
@@ -3705,6 +3755,9 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     term.connect_commit({
         let state = state.clone();
         move |_, text, _| {
+            if is_terminal_reply(text) {
+                return;
+            }
             if let Some(attachment) = state.borrow().panes.get(&id).and_then(|v| v.attachment.as_ref()) {
                 attachment.send(text.as_bytes());
             }
@@ -4724,4 +4777,37 @@ fn snapshot_png(window: &gtk::Widget, path: &std::ffi::OsStr) -> Result<(), Stri
     let renderer = window.native().ok_or("no native")?.renderer().ok_or("no renderer")?;
     let texture = renderer.render_texture(&node, None);
     texture.save_to_png(path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::is_terminal_reply;
+
+    #[test]
+    fn drops_query_replies() {
+        for r in [
+            "\x1b]11;rgb:0000/0000/0000\x07",
+            "\x1b]4;0;rgb:3c3c/3838/3636\x1b\\",
+            "\x1bP1$r0m\x1b\\",
+            "\x1b[?61;1;21;22;28c",
+            "\x1b[>65;8000;1c",
+            "\x1b[0n",
+            "\x1b[24;80R",
+            "\x1b[?1;1R",
+            "\x1b[?2004;1$y",
+            "\x1b[8;24;80t",
+        ] {
+            assert!(is_terminal_reply(r), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_input() {
+        for k in [
+            "a", "hello", "\r", "\x1b", "\x1b]", "\x1bP", "\x1b[A", "\x1b[15~", "\x1b[1;5R",
+            "\x1b[1;2P", "\x1b[<0;10;5M", "\x1b[200~paste\x1b[201~", "\x1b[Z",
+        ] {
+            assert!(!is_terminal_reply(k), "{k:?}");
+        }
+    }
 }
