@@ -134,7 +134,8 @@ pub fn chrome_css() -> String {
         css.push_str(&format!(
             ".pane-tabs .tab-active, .screen-strip .tab-active {{ box-shadow: inset 0 -2px {accent}; }}\n\
              .pane.focused .pane-tabs {{ box-shadow: inset 0 2px {accent}; }}\n\
-             .column-handle:hover {{ background-color: {accent}; }}\n"
+             .column-handle:hover {{ background-color: {accent}; }}\n\
+             .pane.flash {{ box-shadow: inset 0 0 0 3px {accent}; }}\n"
         ));
     }
     css

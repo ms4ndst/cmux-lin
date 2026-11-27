@@ -83,6 +83,7 @@ const CSS: &str = "
 .browser-bar entry { min-height: 0; }
 .notes-count { font-weight: bold; font-size: smaller; }
 .find-bar { padding: 2px 4px; }
+.pane.flash { box-shadow: inset 0 0 0 3px @accent_color; }
 .find-bar entry.error { color: @error_color; }
 ";
 
@@ -1105,6 +1106,20 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
     });
     app.add_action(&theme);
 
+    // Navigation by name, for scripts (the keys call the same functions):
+    // workspace-N / workspace-next / workspace-prev, tab-N / tab-next /
+    // tab-prev, focus-<dir>, resize-<dir> (left, right, up, down), flash.
+    let nav = gio::SimpleAction::new("nav", Some(glib::VariantTy::STRING));
+    nav.connect_activate({
+        let state = state.clone();
+        move |_, target| {
+            if let Some(what) = target.and_then(|t| t.get::<String>()) {
+                navigate(&state, &what);
+            }
+        }
+    });
+    app.add_action(&nav);
+
     let find = gio::SimpleAction::new("find", None);
     find.connect_activate({
         let state = state.clone();
@@ -1344,6 +1359,66 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     }
     bind("<Control>Page_Down", |st, pane| step_tab(st, pane, 1));
     bind("<Control>Page_Up", |st, pane| step_tab(st, pane, -1));
+    bind("<Control>Tab", |st, pane| step_tab(st, pane, 1));
+    bind("<Control><Shift>Tab", |st, pane| step_tab(st, pane, -1));
+    bind("<Control><Shift>ISO_Left_Tab", |st, pane| step_tab(st, pane, -1));
+    bind("<Control><Shift>h", |st, pane| flash_pane(st, pane));
+
+    // Ctrl+1…8: tab N of the focused pane; Ctrl+9: its last tab.
+    // Alt+1…8: workspace N; Alt+9: the last workspace.
+    for n in 1..=9usize {
+        let state_tab = state.clone();
+        controller.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(&format!("<Control>{n}")),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                let pane = state_tab.borrow().target_pane();
+                if let Some(pane) = pane {
+                    jump_tab(&state_tab, pane, n);
+                }
+                glib::Propagation::Stop
+            })),
+        ));
+        let state_ws = state.clone();
+        controller.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(&format!("<Alt>{n}")),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                jump_workspace(&state_ws, n);
+                glib::Propagation::Stop
+            })),
+        ));
+    }
+    for (accel, delta) in [("<Alt>Page_Down", 1isize), ("<Alt>Page_Up", -1)] {
+        let state = state.clone();
+        controller.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(accel),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                step_workspace(&state, delta);
+                glib::Propagation::Stop
+            })),
+        ));
+    }
+    // Ctrl+Alt+arrows: focus the pane in that direction; with Shift, move
+    // the nearest divider that way.
+    for (key, dir) in [("Left", Dir::Left), ("Right", Dir::Right), ("Up", Dir::Up), ("Down", Dir::Down)] {
+        for resize in [false, true] {
+            let state = state.clone();
+            let accel = if resize { format!("<Control><Alt><Shift>{key}") } else { format!("<Control><Alt>{key}") };
+            controller.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(&accel),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    let pane = state.borrow().target_pane();
+                    if let Some(pane) = pane {
+                        if resize {
+                            resize_pane(&state, pane, dir);
+                        } else {
+                            focus_direction(&state, pane, dir);
+                        }
+                    }
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+    }
     window.add_controller(controller);
 }
 
@@ -1607,6 +1682,198 @@ fn step_tab(state: &Shared, pane: u64, delta: isize) {
     if let Some(surface) = next {
         choose_tab(state, pane, surface);
     }
+}
+
+/// Run a navigation by name (`app.nav`).
+fn navigate(state: &Shared, what: &str) {
+    let dir = |name: &str| match name {
+        "left" => Some(Dir::Left),
+        "right" => Some(Dir::Right),
+        "up" => Some(Dir::Up),
+        "down" => Some(Dir::Down),
+        _ => None,
+    };
+    let pane = state.borrow().target_pane();
+    let (verb, arg) = what.split_once('-').unwrap_or((what, ""));
+    match (verb, arg) {
+        ("workspace", "next") => step_workspace(state, 1),
+        ("workspace", "prev") => step_workspace(state, -1),
+        ("workspace", n) => {
+            if let Ok(n @ 1..=9) = n.parse::<usize>() {
+                jump_workspace(state, n);
+            }
+        }
+        ("flash", _) => {
+            if let Some(pane) = pane {
+                flash_pane(state, pane);
+            }
+        }
+        (verb, arg) => {
+            let Some(pane) = pane else { return };
+            match (verb, arg) {
+                ("tab", "next") => step_tab(state, pane, 1),
+                ("tab", "prev") => step_tab(state, pane, -1),
+                ("tab", n) => {
+                    if let Ok(n @ 1..=9) = n.parse::<usize>() {
+                        jump_tab(state, pane, n);
+                    }
+                }
+                ("focus", d) => {
+                    if let Some(d) = dir(d) {
+                        focus_direction(state, pane, d);
+                    }
+                }
+                ("resize", d) => {
+                    if let Some(d) = dir(d) {
+                        resize_pane(state, pane, d);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Tab `n` (1-based) of `pane`; 9 is its last tab.
+fn jump_tab(state: &Shared, pane: u64, n: usize) {
+    let surface = state.borrow().workspace().and_then(|ws| {
+        let tabs = &ws.panes.iter().find(|p| p.id == pane)?.tabs;
+        let index = if n == 9 { tabs.len().checked_sub(1)? } else { n - 1 };
+        tabs.get(index).map(|t| t.surface)
+    });
+    if let Some(surface) = surface {
+        choose_tab(state, pane, surface);
+    }
+}
+
+/// Show workspace `n` (1-based) here; 9 is the last one. Selecting its row
+/// renders it (client-local, like clicking it).
+fn jump_workspace(state: &Shared, n: usize) {
+    let (count, ui) = {
+        let st = state.borrow();
+        (st.workspaces.len(), st.ui.clone())
+    };
+    let index = if n == 9 { count.checked_sub(1) } else { (n <= count).then(|| n - 1) };
+    if let (Some(index), Some(ui)) = (index, ui) {
+        if let Some(row) = ui.list.row_at_index(index as i32) {
+            ui.list.select_row(Some(&row));
+        }
+    }
+}
+
+/// The next (`1`) or previous (`-1`) workspace, wrapping around.
+fn step_workspace(state: &Shared, delta: isize) {
+    let (count, current) = {
+        let st = state.borrow();
+        let current = st.workspaces.iter().position(|w| Some(w.id) == st.selected);
+        (st.workspaces.len(), current)
+    };
+    if count == 0 {
+        return;
+    }
+    let next = current.map_or(0, |i| (i as isize + delta).rem_euclid(count as isize) as usize);
+    jump_workspace(state, next + 1);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Briefly outline a pane in the accent colour, to show where focus is.
+fn flash_pane(state: &Shared, pane: u64) {
+    let root = state.borrow().panes.get(&pane).map(|v| v.root.clone());
+    let Some(root) = root else { return };
+    root.add_css_class("flash");
+    glib::timeout_add_local_once(Duration::from_millis(350), move || root.remove_css_class("flash"));
+}
+
+/// Focus the nearest pane in direction `dir` from `pane`, by where the panes
+/// are on screen (so it works across splits and viewport columns alike).
+fn focus_direction(state: &Shared, pane: u64, dir: Dir) {
+    let target = {
+        let st = state.borrow();
+        let Some(window) = st.window.upgrade() else { return };
+        let bounds = |id: &u64| st.panes.get(id).and_then(|v| v.root.compute_bounds(&window));
+        let Some(from) = bounds(&pane) else { return };
+        let (fx0, fy0, fx1, fy1) = (from.x(), from.y(), from.x() + from.width(), from.y() + from.height());
+        st.panes
+            .keys()
+            .filter(|id| **id != pane)
+            .filter_map(|id| {
+                let r = bounds(id)?;
+                let (x0, y0, x1, y1) = (r.x(), r.y(), r.x() + r.width(), r.y() + r.height());
+                // Distance along the direction, and how far off-axis it is
+                // (0 while the two overlap across the direction).
+                let slack = 4.0;
+                let (gap, off) = match dir {
+                    Dir::Right if x0 >= fx1 - slack => (x0 - fx1, (y0.max(fy0) - y1.min(fy1)).max(0.0)),
+                    Dir::Left if x1 <= fx0 + slack => (fx0 - x1, (y0.max(fy0) - y1.min(fy1)).max(0.0)),
+                    Dir::Down if y0 >= fy1 - slack => (y0 - fy1, (x0.max(fx0) - x1.min(fx1)).max(0.0)),
+                    Dir::Up if y1 <= fy0 + slack => (fy0 - y1, (x0.max(fx0) - x1.min(fx1)).max(0.0)),
+                    _ => return None,
+                };
+                Some((*id, off, gap))
+            })
+            .min_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, ..)| id)
+    };
+    let Some(target) = target else { return };
+    let widget: Option<gtk::Widget> = state.borrow().panes.get(&target).map(|v| {
+        if v.browser { v.web.root.clone().upcast() } else { v.term.clone().upcast() }
+    });
+    if let Some(widget) = widget {
+        widget.grab_focus(); // after the borrow ends; the focus handler records it
+    }
+    state.borrow_mut().focused = Some(target);
+    update_focus_marks(state);
+    flash_pane(state, target);
+}
+
+/// The innermost split around `pane` whose divider runs across `dir` (a
+/// left/right split for Left/Right, an up/down one for Up/Down): its id and
+/// ratio.
+fn split_around(layout: &Layout, pane: u64, horizontal: bool) -> Option<(u64, f64)> {
+    match layout {
+        Layout::Leaf(_) => None,
+        Layout::Split { id, right, ratio, a, b } => {
+            let inner = if a.panes().contains(&pane) {
+                split_around(a, pane, horizontal)
+            } else if b.panes().contains(&pane) {
+                split_around(b, pane, horizontal)
+            } else {
+                return None;
+            };
+            inner.or_else(|| (*right == horizontal).then_some(()).and(id.map(|id| (id, *ratio))))
+        }
+    }
+}
+
+/// Move the divider next to `pane` 5% in direction `dir` (as dragging it
+/// would), here and on the server.
+fn resize_pane(state: &Shared, pane: u64, dir: Dir) {
+    let horizontal = matches!(dir, Dir::Left | Dir::Right);
+    let found = {
+        let st = state.borrow();
+        st.workspace().and_then(|ws| {
+            let layouts = ws.layout.iter().chain(ws.columns.iter().map(|c| &c.layout));
+            layouts.into_iter().find_map(|layout| split_around(layout, pane, horizontal))
+        })
+    };
+    let Some((split, _)) = found else { return };
+    let step = if matches!(dir, Dir::Right | Dir::Down) { 0.05 } else { -0.05 };
+    let apply = {
+        let st = state.borrow();
+        let Some(view) = st.splits.get(&split) else { return };
+        let ratio = (view.ratio.get() + step).clamp(0.1, 0.9);
+        view.ratio.set(ratio);
+        st.send(Ctl::request(json!({ "cmd": "set-split-ratio", "split": split, "ratio": ratio })));
+        view.apply.clone()
+    };
+    apply();
 }
 
 /// A container's children except popovers attached to it (an open rename

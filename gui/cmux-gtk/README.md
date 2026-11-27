@@ -129,7 +129,7 @@ Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shi
 
 ## Keyboard shortcuts
 
-They act on the pane you're typing in (the notification and text size keys work anywhere):
+They act on the pane you're typing in (the workspace, notification and text size keys work anywhere):
 
 | Keys | Action |
 |---|---|
@@ -139,6 +139,11 @@ They act on the pane you're typing in (the notification and text size keys work 
 | `Ctrl+Shift+O` | Split down |
 | `Ctrl+Shift+B` | New browser tab |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+1`…`Ctrl+8` / `Ctrl+9` | Tab 1–8 / last tab of the pane |
+| `Ctrl+Alt+←→↑↓` | Focus the pane in that direction |
+| `Ctrl+Alt+Shift+←→↑↓` | Move the nearest divider that way (5%) |
+| `Ctrl+Shift+H` | Flash the focused pane |
 | `Ctrl+Shift+Z` | Zoom / unzoom the pane |
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
@@ -150,6 +155,17 @@ They act on the pane you're typing in (the notification and text size keys work 
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in a terminal pane (also `Shift+Insert`) |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
+| `Alt+1`…`Alt+8` / `Alt+9` | Workspace 1–8 / last workspace |
+| `Alt+PageDown` / `Alt+PageUp` | Next / previous workspace |
+
+The window takes these keys before the terminal does, so a program in a pane doesn't get them (for example `Alt+1` as readline's digit argument, or `Ctrl+Tab`).
+
+Directional focus goes by where panes are on screen, so it works across splits and viewport columns alike, and flashes the pane it lands on. Resizing moves the divider the way a drag does, so the TUI follows. The same moves are available to scripts as the action `app.nav` with a name: `workspace-N`, `workspace-next`, `workspace-prev`, `tab-N`, `tab-next`, `tab-prev`, `focus-<dir>`, `resize-<dir>` (`left`, `right`, `up`, `down`) or `flash`, for example:
+
+```bash
+gdbus call --session --dest dev.cmuxlin.CmuxGtk.main --object-path /dev/cmuxlin/CmuxGtk/main \
+  --method org.gtk.Actions.Activate nav '[<"focus-right">]' '{}'
+```
 
 ## Requirements
 
