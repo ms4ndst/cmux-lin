@@ -36,6 +36,7 @@ mod layout;
 mod meta;
 mod notes;
 mod palette;
+mod settings;
 mod theme;
 
 use cmux_browser_provider as provider;
@@ -224,6 +225,10 @@ struct State {
     meta_targets: meta::Targets,
     /// A tab a just-built workspace layout wants shown, once the tree has it.
     pending_focus: Option<u64>,
+    /// The window's settings (`~/.config/cmux-lin/gtk.json`), and the
+    /// settings window while it's open.
+    settings: settings::Settings,
+    settings_window: glib::WeakRef<gtk::Window>,
 }
 
 impl State {
@@ -298,6 +303,9 @@ fn build_ui(app: &gtk::Application, session: &str) {
             return;
         }
     };
+
+    let initial_settings = settings::Settings::load();
+    provider::set_browser((!initial_settings.browser.is_empty()).then(|| PathBuf::from(&initial_settings.browser)));
 
     let provider = gtk::CssProvider::new();
     provider.load_from_string(&full_css());
@@ -472,7 +480,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     // does), like plain `cmux`. Only at launch: a session that stops while
     // the window is open (Ctrl-b Q) stays stopped; ☰ → Start session
     // brings it back.
-    if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+    if initial_settings.auto_start && std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
         ensure_session(session, ui_tx.clone());
     }
 
@@ -507,6 +515,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
         meta: HashMap::new(),
         meta_targets: meta_targets.clone(),
         pending_focus: None,
+        settings: initial_settings.clone(),
+        settings_window: glib::WeakRef::new(),
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -590,17 +600,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
     // Browser tabs need a browser provider; run one unless disabled. It
     // stays idle when another provider (cmux-browser or a standalone
     // cmux-browser-provider) already owns the session's lease.
-    if std::env::var_os("CMUX_GTK_NO_PROVIDER").is_none() {
-        let ui_tx = state.borrow().ui_tx.clone();
-        let handle = provider::start(state.borrow().socket_path.clone(), move |report| {
-            let message = match report {
-                provider::Report::Info(line) => UiMsg::Status(line),
-                provider::Report::Problem(problem) => UiMsg::BrowserProblem(Some(problem)),
-                provider::Report::Resolved => UiMsg::BrowserProblem(None),
-            };
-            let _ = ui_tx.send_blocking(message);
-        });
-        state.borrow_mut().provider = Some(handle);
+    if state.borrow().settings.browser_provider {
+        start_provider(&state);
     }
 
     new_ws.connect_clicked({
@@ -862,7 +863,17 @@ fn build_ui(app: &gtk::Application, session: &str) {
     if let Some(path) = std::env::var_os("CMUX_GTK_SNAPSHOT") {
         let window = window.clone();
         let panel = ui.notes.popover();
+        let snap_state = state.clone();
         glib::timeout_add_local(Duration::from_secs(2), move || {
+            // The settings window too, while it's open (`<name>-settings.png`).
+            if let Some(settings_window) = snap_state.borrow().settings_window.upgrade() {
+                let mut base = std::path::PathBuf::from(&path);
+                base.set_extension("");
+                let file = format!("{}-settings.png", base.display());
+                if let Err(error) = snapshot_png(settings_window.upcast_ref(), std::ffi::OsStr::new(&file)) {
+                    eprintln!("cmux-gtk: settings snapshot failed: {error}");
+                }
+            }
             if let Err(error) = snapshot_png(window.upcast_ref(), &path) {
                 eprintln!("cmux-gtk: snapshot failed: {error}");
             }
@@ -925,14 +936,21 @@ const FONT_SCALE_MAX: f64 = 3.0;
 /// in steps of 10%, and remember it. The grids shrink or grow, and the
 /// resize timer reports the new sizes, so the shells reflow.
 fn change_font_scale(state: &Shared, ui: &Ui, change: i32) {
+    let current = state.borrow().font_scale;
+    let scale = match change {
+        0 => 1.0,
+        n => (current * 1.1f64.powi(n) * 100.0).round() / 100.0,
+    };
+    // Snap back to exactly 100% when a step lands close to it.
+    let scale = if (scale - 1.0).abs() < 0.04 { 1.0 } else { scale };
+    set_font_scale(state, ui, scale);
+}
+
+/// Set every terminal's text size and remember it.
+fn set_font_scale(state: &Shared, ui: &Ui, scale: f64) {
     let scale = {
         let mut st = state.borrow_mut();
-        let scale = match change {
-            0 => 1.0,
-            n => (st.font_scale * 1.1f64.powi(n) * 100.0).round() / 100.0,
-        };
-        // Snap back to exactly 100% when a step lands close to it.
-        let scale = if (scale - 1.0).abs() < 0.04 { 1.0 } else { scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX) };
+        let scale = scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX);
         st.font_scale = scale;
         for view in st.panes.values() {
             view.term.set_font_scale(scale);
@@ -945,6 +963,103 @@ fn change_font_scale(state: &Shared, ui: &Ui, change: i32) {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(path, format!("{scale}\n"));
+    }
+}
+
+/// Start the built-in browser provider (unless `CMUX_GTK_NO_PROVIDER` is
+/// set). It stays idle when another provider already serves the session.
+fn start_provider(state: &Shared) {
+    if std::env::var_os("CMUX_GTK_NO_PROVIDER").is_some() || state.borrow().provider.is_some() {
+        return;
+    }
+    let ui_tx = state.borrow().ui_tx.clone();
+    let handle = provider::start(state.borrow().socket_path.clone(), move |report| {
+        let message = match report {
+            provider::Report::Info(line) => UiMsg::Status(line),
+            provider::Report::Problem(problem) => UiMsg::BrowserProblem(Some(problem)),
+            provider::Report::Resolved => UiMsg::BrowserProblem(None),
+        };
+        let _ = ui_tx.send_blocking(message);
+    });
+    state.borrow_mut().provider = Some(handle);
+}
+
+/// Stop it (unregisters and closes its browser).
+fn stop_provider(state: &Shared) {
+    let handle = state.borrow_mut().provider.take();
+    drop(handle); // outside the borrow: it waits for the provider thread
+}
+
+/// Open the settings window, or bring it up if it's open.
+fn open_settings(state: &Shared, ui: &Ui) {
+    if let Some(window) = state.borrow().settings_window.upgrade() {
+        window.present();
+        return;
+    }
+    let Some(parent) = state.borrow().window.upgrade() else { return };
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_default();
+    let mut files = Vec::new();
+    if let Some(tui) = theme::config_path() {
+        files.push(("Session settings (cmux-tui.json)".to_string(), tui));
+    }
+    files.push(("Palette commands for every project (cmux.json)".to_string(), config.join("cmux/cmux.json")));
+    if let Some(ghostty) = theme::ghostty_config_path() {
+        files.push(("Terminal colours (Ghostty config)".to_string(), ghostty));
+    }
+    let context = settings::Context {
+        themes: installed_themes(),
+        theme: current_theme(),
+        text_scale: state.borrow().font_scale,
+        files,
+    };
+    let host: settings::Host = Rc::new({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |request| match request {
+            settings::Request::Changed(new) => apply_settings(&state, &ui, new),
+            settings::Request::Theme(name) => {
+                let app = state.borrow().app.upgrade();
+                if let Some(app) = app {
+                    app.activate_action("theme", Some(&name.to_variant()));
+                }
+            }
+            settings::Request::TextScale(scale) => set_font_scale(&state, &ui, scale),
+            settings::Request::ReloadConfig => {
+                state.borrow().send(Ctl::request(json!({ "cmd": "reload-config" })));
+                ui.status.set_text("Asked the session to reload its config");
+            }
+        }
+    });
+    let initial = state.borrow().settings.clone();
+    let window = settings::window(&parent, initial, context, host);
+    state.borrow_mut().settings_window = window.downgrade();
+    window.present();
+}
+
+/// Settings changed in the settings window: apply what differs.
+fn apply_settings(state: &Shared, ui: &Ui, new: settings::Settings) {
+    let old = std::mem::replace(&mut state.borrow_mut().settings, new.clone());
+    let terminal = |s: &settings::Settings| (s.font.clone(), s.scrollback, s.cursor_shape.clone(), s.cursor_blink);
+    if terminal(&old) != terminal(&new) {
+        for view in state.borrow().panes.values() {
+            new.apply_to(&view.term);
+        }
+    }
+    if old.sidebar_details != new.sidebar_details {
+        draw_sidebar(state, ui);
+    }
+    if old.browser != new.browser || old.browser_provider != new.browser_provider {
+        provider::set_browser((!new.browser.is_empty()).then(|| PathBuf::from(&new.browser)));
+        // Restart it so a different browser takes over at once.
+        stop_provider(state);
+        if new.browser_provider {
+            start_provider(state);
+            ui.status.set_text("Browser provider restarted");
+        } else {
+            ui.status.set_text("Browser provider stopped; browser tabs need another provider");
+        }
     }
 }
 
@@ -1074,6 +1189,7 @@ fn build_main_menu() -> gio::Menu {
     }
     let look = gio::Menu::new();
     look.append(Some("Command palette (Ctrl+Shift+P)"), Some("app.palette"));
+    look.append(Some("Settings… (Ctrl+,)"), Some("app.settings"));
     look.append_submenu(Some("Theme"), &themes);
     look.append(Some("Workspaces / Files (Ctrl+Shift+Y)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
@@ -1144,6 +1260,13 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
         }
     });
     app.add_action(&theme);
+
+    let open_settings_action = gio::SimpleAction::new("settings", None);
+    open_settings_action.connect_activate({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |_, _| open_settings(&state, &ui)
+    });
+    app.add_action(&open_settings_action);
 
     let open_palette = gio::SimpleAction::new("palette", None);
     open_palette.connect_activate({
@@ -1410,6 +1533,7 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
     // These work with no pane too.
     for (accel, action) in [
         ("<Control><Shift>p", "app.palette"),
+        ("<Control>comma", "app.settings"),
         ("<Control><Shift>i", "app.notifications"),
         ("<Control><Shift>j", "app.jump-unread"),
         ("<Control>plus", "app.font-larger"),
@@ -1648,7 +1772,8 @@ fn draw_sidebar(state: &Shared, ui: &Ui) {
     }
     let st = state.borrow();
     for ws in &st.workspaces {
-        ui.list.append(&sidebar_row(ws, &st.agents, st.meta.get(&ws.id)));
+        let meta = st.meta.get(&ws.id).filter(|_| st.settings.sidebar_details);
+        ui.list.append(&sidebar_row(ws, &st.agents, meta));
     }
     let target = st.workspaces.iter().position(|w| Some(w.id) == st.selected);
     drop(st);
@@ -1974,6 +2099,7 @@ fn palette_items(state: &Shared, ui: &Ui) -> Vec<palette::Item> {
     items.push(Item::new("Rename workspace…", action("rename-this-workspace", None)));
     items.push(Item::new("Close workspace…", action("close-this-workspace", None)).detail("Ends its shells"));
     items.push(Item::new("Start session", action("start-session", None)));
+    items.push(Item::new("Settings", action("settings", None)).keywords("preferences options font scrollback cursor").shortcut("Ctrl+,"));
 
     // Themes.
     let current = current_theme();
@@ -3057,8 +3183,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     let term = vte4::Terminal::new();
     term.set_hexpand(true);
     term.set_vexpand(true);
-    term.set_scrollback_lines(10_000);
-    term.set_font(Some(&gtk::pango::FontDescription::from_string("Monospace 11")));
+    state.borrow().settings.apply_to(&term);
     term.set_font_scale(state.borrow().font_scale);
     let find = find::FindBar::new(&term);
 
@@ -3621,6 +3746,9 @@ fn on_notification(state: &Shared, ui: &Ui, id: u64, title: &str, body: &str, le
     let window_active = st.window.upgrade().is_some_and(|w| w.is_active());
     let visible = surface.is_some_and(|s| st.panes.values().any(|v| v.surface == Some(s)));
     if window_active && visible {
+        return;
+    }
+    if !st.settings.desktop_notifications {
         return;
     }
     let Some(app) = st.app.upgrade() else { return };

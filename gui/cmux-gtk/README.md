@@ -164,15 +164,29 @@ gdbus call --session --dest dev.cmuxlin.CmuxGtk.main --object-path /dev/cmuxlin/
   --method org.gtk.Actions.Activate palette-run '[<"format changed files">]' '{}'
 ```
 
+## Settings
+
+`Ctrl+,` (or ☰ → **Settings…**, or the palette) opens the settings window. Changes apply at once:
+
+| Section | Settings |
+|---|---|
+| Appearance | Theme, terminal font, text size |
+| Terminal | Scrollback lines, cursor shape, blinking cursor |
+| Window | Desktop notifications, branch and ports in the sidebar, start the session automatically |
+| Browser tabs | The built-in browser provider on or off, and which browser it uses (Automatic, or any Chromium-family browser found on `PATH`) |
+| Config files | Open the session's `cmux-tui.json`, the user-wide `cmux.json` (created empty if missing) and the Ghostty colours file, and ask the session to reload its config |
+
+The window's settings are saved in `~/.config/cmux-lin/gtk.json`. The theme is stored where `cmux-theme` keeps it, and the text size in `~/.local/state/cmux-lin/gtk-font-scale`. The session's own settings (keys, the TUI's sidebar and status bar, user commands) stay in `cmux-tui.json`. Changing the browser restarts the built-in provider, so the next browser tab uses the new one. A browser chosen here wins over `CMUX_LIN_BROWSER`.
+
 ## The ☰ menu
 
-**Command palette**, **Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
+**Command palette**, **Settings…**, **Start session**, **Theme**, the Workspaces/Files switch, Find and text size, the notification actions, and New / Rename / Close workspace.
 
 ## Browser tabs
 
 A cmux browser tab is a real Chromium page that the session gets from a *browser provider*, so the TUI, this window and agents all see and drive the same page. cmux-tui never runs a browser itself, and upstream's provider (cmux-browser, a patched Chromium) isn't publicly buildable, so this repo has its own:
 
-- **Built in.** The app starts a provider when it connects, unless another one is already registered. When the session has a browser tab, it launches a headless Chromium-family browser, opens a page for every browser tab, and registers them. It takes `CMUX_LIN_BROWSER` if set, otherwise the first of `chromium`, `chromium-browser`, `ungoogled-chromium`, `brave-browser`, `brave`, `microsoft-edge`, `google-chrome-stable`, `google-chrome` on `PATH`. Each browser gets its own profile in `~/.local/share/cmux-lin/browsers/<name>`, so logins persist. Set `CMUX_GTK_NO_PROVIDER=1` to turn it off.
+- **Built in.** The app starts a provider when it connects, unless another one is already registered. When the session has a browser tab, it launches a headless Chromium-family browser, opens a page for every browser tab, and registers them. It takes the browser chosen in Settings, else `CMUX_LIN_BROWSER` if set, otherwise the first of `chromium`, `chromium-browser`, `ungoogled-chromium`, `brave-browser`, `brave`, `microsoft-edge`, `google-chrome-stable`, `google-chrome` on `PATH`. Each browser gets its own profile in `~/.local/share/cmux-lin/browsers/<name>`, so logins persist. Turn it off in Settings, or for one run with `CMUX_GTK_NO_PROVIDER=1`.
 - **Standalone.** `cmux-browser-provider [--session NAME]` does the same without the window, so browser tabs also work in the TUI (which draws them with kitty graphics). It's its own crate, [`browser-provider/`](../../browser-provider), with no GTK dependency, and `scripts/40-install.sh` installs it. Stop it with Ctrl-C or `kill`.
 
 The browser never outlives its provider, even if the app is killed with `kill -9` or crashes. It's started with `--remote-debugging-pipe`, and Chromium exits when that pipe closes, which the kernel does whenever the provider's process ends. A parent-death signal alone isn't enough, because some launchers, Brave's for one, run the real browser as a grandchild.
@@ -242,7 +256,7 @@ The server doesn't track branches or ports, so the window works them out itself 
 
 ## Keyboard shortcuts
 
-They act on the pane you're typing in (the palette, workspace, notification and text size keys work anywhere):
+They act on the pane you're typing in (the palette, settings, workspace, notification and text size keys work anywhere):
 
 | Keys | Action |
 |---|---|
@@ -261,6 +275,7 @@ They act on the pane you're typing in (the palette, workspace, notification and 
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
 | `Ctrl+Shift+P` | Command palette |
+| `Ctrl+,` | Settings |
 | `Ctrl+Shift+F` | Find in the terminal |
 | `Ctrl++` / `Ctrl+−` / `Ctrl+0` | Larger / smaller / normal text (every terminal) |
 | `Ctrl+Shift+Y` | Sidebar: Workspaces / Files |

@@ -307,25 +307,56 @@ impl Session {
     }
 }
 
-/// The browser binary: `CMUX_LIN_BROWSER`, else the first Chromium-family
-/// browser on PATH. Open-source Chromium comes first; Google Chrome (which
-/// reports usage to Google even when headless) is the last resort.
+/// A browser chosen by the host app (its settings), ahead of
+/// `CMUX_LIN_BROWSER`. Used from the next browser launch on.
+static BROWSER_CHOICE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Choose the browser binary (`None`: automatic). Takes effect the next
+/// time a browser starts, so restart the provider to switch at once.
+pub fn set_browser(path: Option<PathBuf>) {
+    if let Ok(mut choice) = BROWSER_CHOICE.lock() {
+        *choice = path;
+    }
+}
+
+/// The Chromium-family browsers on PATH, in the order the provider prefers
+/// them (for a settings list).
+pub fn installed_browsers() -> Vec<PathBuf> {
+    let Some(path) = std::env::var_os("PATH") else { return Vec::new() };
+    let mut found: Vec<PathBuf> = Vec::new();
+    for name in BROWSER_NAMES {
+        if let Some(candidate) = std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()) {
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+/// Chromium-family browser names, most preferred first. Open-source
+/// Chromium comes first; Google Chrome (which reports usage to Google even
+/// when headless) is the last resort.
+const BROWSER_NAMES: [&str; 8] = [
+    "chromium",
+    "chromium-browser",
+    "ungoogled-chromium",
+    "brave-browser",
+    "brave",
+    "microsoft-edge",
+    "google-chrome-stable",
+    "google-chrome",
+];
+
+/// The browser binary: the host's choice, else `CMUX_LIN_BROWSER`, else the
+/// first of [`BROWSER_NAMES`] on PATH.
 fn browser_binary() -> Option<PathBuf> {
+    if let Some(choice) = BROWSER_CHOICE.lock().ok().and_then(|c| c.clone()) {
+        return Some(choice);
+    }
     if let Some(path) = std::env::var_os("CMUX_LIN_BROWSER") {
         return Some(PathBuf::from(path));
     }
-    let names = [
-        "chromium",
-        "chromium-browser",
-        "ungoogled-chromium",
-        "brave-browser",
-        "brave",
-        "microsoft-edge",
-        "google-chrome-stable",
-        "google-chrome",
-    ];
     let path = std::env::var_os("PATH")?;
-    names
+    BROWSER_NAMES
         .iter()
         .flat_map(|name| std::env::split_paths(&path).map(move |dir| dir.join(name)))
         .find(|candidate| candidate.is_file())
@@ -349,7 +380,7 @@ fn launch_chrome() -> Result<Chrome, String> {
          to a Chromium-family browser.",
     )?;
     if !binary.is_file() {
-        return Err(format!("CMUX_LIN_BROWSER points to {}, which doesn't exist.", binary.display()));
+        return Err(format!("The chosen browser, {}, doesn't exist.", binary.display()));
     }
     let name = binary.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let profile = profile_dir(&name);
