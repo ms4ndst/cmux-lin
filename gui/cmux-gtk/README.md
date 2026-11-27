@@ -1,33 +1,65 @@
-# cmux-gtk (prototype)
+# cmux-gtk
 
-A throwaway prototype of a native GTK4 window for a cmux-tui session. It's here to test whether a native Linux frontend is practical, not as a finished app.
+A native GTK4 window for a cmux session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses).
 
-The cmux-tui server stays in charge of everything. This window is just another client:
+![The cmux-gtk window: workspaces with agent badges, a split screen, and the agents queue](../../docs/screenshots/overview.png)
 
-- the sidebar lists the session's workspaces (re-read every 1.5 s, and straight after every action), with an **Agents** queue below them and a **Files** view one click away (see Sidebar);
-- which workspace, screen, tab and pane you're looking at belongs to this window alone, as in upstream's design: switching here doesn't move the TUI or another window, and switching there doesn't move this one. Things just created (a new workspace, screen or tab, including one a tab was moved into) come into view;
-- a screen strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout): click one to switch, `×` to close it and its terminals, `+` for a new one. Each screen button shows the most urgent agent badge on that screen;
-- the active screen's split layout is drawn as resizable panes, and dragging a divider moves it in the TUI too (and the other way round);
-- every pane has a tab strip and a VTE terminal (the widget GNOME Terminal uses) for its active tab;
-- tab strip: click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down, `⋮` for the pane menu (zoom, swap with a neighbour, rename tab, close pane);
-- double-click a workspace, screen or tab to rename it; an empty name goes back to the default;
-- drag a tab to reorder it, onto another pane's tab strip or body to move it there, onto a workspace in the sidebar to move it to that workspace, or into the empty sidebar space for a new workspace. The terminal or browser keeps running;
-- the pane menu also has **Undo layout change** (`Ctrl+Shift+U`, the screen's last split, swap, zoom or resize) and **Move tab to new workspace**. An undo that would close panes asks first and says how many;
-- screens laid out in viewport columns (the TUI's `Ctrl-b g`, here `Ctrl+Shift+G` or the pane menu's **New column to the right**) show as a horizontally scrolling row: each column is its own fraction of the visible width, has its own splits inside, and resizes by dragging its right edge;
-- a zoomed pane fills its screen (zoom from the pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom;
-- browser tabs show the live page with an address bar and back/forward/reload; clicks, scrolling and typing go to the page (see below);
-- keystrokes and pastes go to the pane you're typing in;
-- resizing the window or a pane resizes that terminal on the server, so the shell reflows;
-- the whole window follows the active cmux theme: terminal colours and the window's own chrome, meaning the header, sidebar, tab strips, menus and dividers, styled from the theme's chrome keys (`status_bg`/`status_fg`, `sidebar_active_bg`, `tab_bar_bg`/`tab_active_bg`, `menu_*`, `border_active` as the accent). It restyles live when the theme changes, whether from the ☰ menu, `cmux-theme` or the TUI;
-- each session gets its own window (app id `dev.cmuxlin.CmuxGtk.<session>`): `cmux-gtk --session work` opens beside the `main` window, and opening a session that already has a window brings that window up;
-- agent attention shows as badges on tabs and sidebar rows (see below), and notifications pop up on the desktop;
-- the header's `+` creates a workspace, and the **☰ menu** has **Theme** (every installed cmux theme, the current one marked), the Workspaces/Files switch, and New / Rename / Close workspace. Right-click a workspace in the sidebar for Rename and Close;
-- **closing ends the shells**: closing a tab (`×`, `Ctrl+Shift+W`), a pane (pane menu), a screen (`×` on the screen strip) or a workspace also ends the shells it held, via `close-terminal`. The server's own close commands only remove the layout, which would leave the shells running unseen in the session (the TUI behaves that way). A single tab closes at once; a pane or screen with two or more shells, and any workspace, asks first and says how many will end;
-- picking a **theme** runs `cmux-theme set`, the same as the TUI's picker, so it switches everywhere at once: the config, the Ghostty colour block, every session's terminals, and this window's badges (plus the desktop theme, if you paired one);
-- in a terminal pane, `Ctrl+Shift+C` copies the selection and `Ctrl+Shift+V` or `Shift+Insert` pastes (plain Ctrl+C/V belong to the program running), and right-click opens a menu with Copy, Paste, Select all, New tab, Split right/down and Zoom. Shift+right-click goes to the program instead, for terminal apps that use the mouse;
-- if the session stops or restarts, the window dims and waits, then reconnects by itself and re-attaches every pane (it can also be started before the session exists).
+The cmux-tui server stays in charge of everything, and this window is just another client of it. The TUI, this window and agents all see the same workspaces, terminals and browser pages. All layout changes (splits, tabs, moves, zoom, names) are requests to the server, and the window redraws from the tree the server reports back, so its layout can't drift from the TUI's. Only the selection belongs to the window: which workspace, screen, tab and pane you're looking at is this window's alone, as in upstream's design. Switching here doesn't move the TUI or another window, and switching there doesn't move this one. Things just created (a new workspace, screen or tab, including one a tab was moved into) come into view.
 
-All layout changes (splits, tabs, moves, zoom, names) are requests to the server, and the window redraws from the tree the server reports back, so the layout can't drift from the TUI's. Only the selection is the window's own.
+| | |
+|---|---|
+| ![A browser tab with the live upstream repo page beside an agent's terminal](../../docs/screenshots/browser-tab.png) | ![The files view following the focused terminal's folder](../../docs/screenshots/files-view.png) |
+| [Browser tabs](#browser-tabs) | The [Files](#sidebar) view |
+| ![The same window in the light Latte theme](../../docs/screenshots/light-theme.png) | |
+| Following the Latte theme | |
+
+## Install
+
+`scripts/30-build.sh` builds the window when `gtk4-devel` and `vte291-gtk4-devel` are installed, and `scripts/40-install.sh` installs it as `~/.local/bin/cmux-gtk` with a **cmux** entry in the application launcher (it opens the `main` session). From a terminal:
+
+```bash
+cmux-gtk                    # the "main" session
+cmux-gtk --session work     # another session, in its own window
+```
+
+Each session gets its own window (app id `dev.cmuxlin.CmuxGtk.<session>`). `cmux-gtk --session work` opens beside the `main` window, and opening a session that already has a window brings that window up.
+
+If the session isn't running (after a reboot, say), the window starts it, like plain `cmux` does (`cmux server ensure`), and connects. A session that stops while the window is open stays stopped; ☰ → **Start session** brings it back. If the session restarts, the window dims and waits, then reconnects by itself and re-attaches every pane.
+
+## Workspaces, screens and panes
+
+- **Sidebar:** the session's workspaces, with an **Agents** queue below them and a **Files** view one click away (see [Sidebar](#sidebar)). The header's `+` creates a workspace. Right-click a workspace for Rename and Close.
+- **Screens:** a strip above the panes lists the workspace's screens (cmux's equivalent of tmux windows, each with its own layout). Click one to switch, `×` to close it, `+` for a new one. Each screen button shows the most urgent agent badge on that screen.
+- **Splits:** the active screen's split layout is drawn as resizable panes. Dragging a divider moves it in the TUI too, and the other way round.
+- **Tabs:** every pane has a tab strip. Click a tab to switch, `×` to close, `+` for a new tab, `🌐` for a browser tab, `┃`/`━` to split right/down, `⋮` for the pane menu (zoom, swap with a neighbour, rename tab, undo, close pane).
+- **Renaming:** double-click a workspace, screen or tab. An empty name goes back to the default.
+- **Drag and drop:** drag a tab to reorder it, onto another pane's tab strip or body to move it there, onto a workspace in the sidebar to move it to that workspace, or into the empty sidebar space for a new workspace. The terminal or browser keeps running.
+- **Undo:** the pane menu's **Undo layout change** (`Ctrl+Shift+U`) undoes the screen's last split, swap, zoom or resize. An undo that would close panes asks first and says how many. The pane menu also has **Move tab to new workspace**.
+- **Viewport columns:** screens laid out in columns (the TUI's `Ctrl-b g`, here `Ctrl+Shift+G` or the pane menu's **New column to the right**) show as a horizontally scrolling row. Each column takes its own fraction of the visible width, has its own splits inside, and resizes by dragging its right edge.
+- **Zoom:** a zoomed pane fills its screen (pane menu, `Ctrl+Shift+Z`, or the TUI), and the split comes back when you unzoom.
+
+### Closing ends the shells
+
+Closing a tab (`×`, `Ctrl+Shift+W`), a pane (pane menu), a screen (`×` on the screen strip) or a workspace (☰ menu or right-click) also ends the shells it held, via `close-terminal`. The server's own close commands only remove the layout, which would leave the shells running unseen in the session (the TUI behaves that way). A single tab closes at once. A pane or screen with two or more shells, and any workspace, asks first and says how many will end.
+
+## Terminals
+
+- Keystrokes and pastes go to the pane you're typing in.
+- Resizing the window or a pane resizes that terminal on the server, so the shell reflows.
+- `Ctrl+Shift+C` copies the selection, and `Ctrl+Shift+V` or `Shift+Insert` pastes. Plain Ctrl+C/V belong to the program running.
+- Right-click opens a menu with Copy, Paste, Select all, New tab, Split right/down and Zoom. Shift+right-click goes to the program instead, for terminal apps that use the mouse.
+
+## Themes
+
+The whole window follows the active cmux theme: the terminal colours, and the window's own chrome (header, sidebar, tab strips, menus and dividers), styled from the theme's chrome keys (`status_bg`/`status_fg`, `sidebar_active_bg`, `tab_bar_bg`/`tab_active_bg`, `menu_*`, `border_active` as the accent). It restyles live whenever the theme changes, whether from the ☰ menu, `cmux-theme` or the TUI.
+
+☰ → **Theme** lists every installed cmux theme with the current one marked. Picking one runs `cmux-theme set`, the same as the TUI's picker, so it switches everywhere at once: the config, the Ghostty colour block, every session's terminals, and this window (plus the desktop theme, if you paired one).
+
+Terminal text stays legible in any theme; see [How it works](#how-it-works).
+
+## The ☰ menu
+
+**Start session**, **Theme**, the Workspaces/Files switch, and New / Rename / Close workspace.
 
 ## Browser tabs
 
@@ -102,10 +134,10 @@ They act on the pane you're typing in:
 
 ## Requirements
 
-- **Always:** a running cmux-tui session, plus `gtk4-devel` and `vte291-gtk4-devel` to build.
+- **Always:** cmux-tui (the window starts the session if needed), plus `gtk4-devel` and `vte291-gtk4-devel` to build.
 - **Only for browser tabs:** a Chromium-based browser, for example Chromium (`sudo dnf install chromium`), Brave or Microsoft Edge. Google Chrome works too, but it's only used if nothing else is installed, because it reports usage to Google even when run headless. Firefox can't be used: cmux talks to pages over the Chrome DevTools Protocol, which Firefox no longer supports. Without one, everything else works, and a browser tab says what's missing instead of showing a page.
 
-## Build and run
+## Build from source
 
 Needs `gtk4-devel` and `vte291-gtk4-devel`, plus the upstream source fetched by `scripts/20-fetch-source.sh` (the app uses upstream's Rust SDK from there).
 
@@ -114,24 +146,24 @@ cd gui/cmux-gtk
 cargo run --release -- --session main
 ```
 
-The window waits for the session if it isn't running yet (`cmux server start --session main`, or just `cmux`). A session with no workspaces shows an empty sidebar until you press `+` or attach the TUI once.
+A session with no workspaces shows an empty sidebar until you press `+` or attach the TUI once.
 
 ## How it works
 
 Each pane's visible terminal gets its own connection to the session socket, attached in byte mode. The server first sends a replay of the screen, then live output, all as ordinary terminal escape sequences that VTE renders directly. Input (`send`) and size reports (`resize-surface`) go over **that same connection**.
 
-That last part is a protocol rule: the server sizes a terminal from its attached viewers only, treats every connection as a separate viewer, and gives the size to the most recently active one. A resize sent on any other connection comes back `accepted: false`. The Rust SDK's raw attach stream doesn't let you send on its connection, so the attachment code speaks the protocol's newline-delimited JSON directly. The workspace tree and workspace creation still go through the SDK.
+That last part is a protocol rule: the server sizes a terminal from its attached viewers only, treats every connection as a separate viewer, and gives the size to the most recently active one. A resize sent on any other connection comes back `accepted: false`. The Rust SDK's raw attach stream doesn't let you send on its connection, so the attachment code speaks the protocol's newline-delimited JSON directly. The workspace tree is read the same way (`list-workspaces`), because the SDK's typed tree drops fields the window needs. Workspace creation still goes through the SDK.
 
-If a tree poll fails, the window closes every attachment, dims itself and blocks input, and the control thread retries the socket every second. When a tree can be read again, each pane re-attaches and gets a fresh screen replay. Pane widgets are reused by pane id, so a restart that keeps the layout doesn't rebuild anything; shells running in the session survive a server restart.
+The tree is re-read every 1.5 s and straight after every action. If a tree poll fails, the window closes every attachment, dims itself and blocks input, and the control thread retries the socket every second. When a tree can be read again, each pane re-attaches and gets a fresh screen replay. Pane widgets are reused by pane id, so a restart that keeps the layout doesn't rebuild anything; shells running in the session survive a server restart.
 
-A third connection subscribes to session events. `notification` events become desktop notifications, and tree, agent and notification events trigger an immediate re-poll of the tree and the agent roster (`list-agents`), so badges update within a moment rather than on the next 1.5 s poll.
+A third connection subscribes to session events. `notification` events become desktop notifications, and tree, agent and notification events trigger an immediate re-poll of the tree and the agent roster (`list-agents`), so badges update within a moment rather than on the next poll.
 
 Terminal colours come from the active theme itself: the `~/.config/ghostty/config` block `cmux-theme` writes, which is also what the server loads. The window reads it directly and re-colours every terminal as soon as it changes, so a theme switch shows at once whatever colours the server is holding. A program's own colour changes (OSC 10/11/12 and OSC 4, which the server reports as overrides) still win. After that comes a legibility guard: text gets at least 4.5:1 contrast against the background and ANSI colours 1–15 at least 3:1, each nudged toward white or black only as far as needed, so a theme with low-contrast pairs stays readable. Colour 0 is left as is, because it's mostly used as a background. Colours a program prints in fixed RGB, such as powerline prompt segments, keep their literal values, as in any terminal.
 
 ## Not done
 
 - moving whole panes between workspaces (tabs move; a pane empties and closes);
-- the TUI's machines view and custom sidebar plugins (`sidebar.plugin`), which need remote machines or a plugin configured on the server;
+- the TUI's machines view and custom sidebar plugins (`sidebar.plugin`), which need remote machines or a plugin configured on the server.
 
 ## Debugging
 

@@ -416,6 +416,13 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let socket_path = config.socket_path.clone();
     backend::spawn_control(config, ctl_rx, ui_tx.clone());
     backend::spawn_events(socket_path.clone(), ctl_tx.clone(), ui_tx.clone());
+    // Start the session if it isn't running (after a reboot nothing else
+    // does), like plain `cmux`. Only at launch: a session that stops while
+    // the window is open (Ctrl-b Q) stays stopped; ☰ → Start session
+    // brings it back.
+    if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+        ensure_session(session, ui_tx.clone());
+    }
 
     let state: Shared = Rc::new(RefCell::new(State {
         socket_path,
@@ -698,7 +705,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         }
     });
     app.add_action(&toggle_files);
-    install_app_actions(app, &state, &ui);
+    install_app_actions(app, &state, &ui, session);
 
     // Right-click a workspace in the sidebar: Rename / Close.
     let row_menu = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
@@ -834,6 +841,40 @@ fn installed_themes() -> Vec<String> {
 
 /// The `cmux-theme` script (installed by scripts/40-install.sh), on PATH or
 /// in ~/.local/bin (a desktop launch may not have that on PATH).
+/// The `cmux-tui` binary (installed by scripts/40-install.sh), on PATH or in
+/// ~/.local/bin (a desktop launch may not have that on PATH).
+fn cmux_tui() -> PathBuf {
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).map(|d| d.join("cmux-tui")).find(|p| p.is_file())
+    });
+    on_path.unwrap_or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/cmux-tui")).unwrap_or_default()
+    })
+}
+
+/// Start `session`'s server if it isn't running (`cmux-tui server ensure`
+/// starts a detached owner, or reuses a running one). Runs in the
+/// background; the window connects as soon as the session answers.
+fn ensure_session(session: &str, ui: async_channel::Sender<UiMsg>) {
+    let session = session.to_string();
+    let _ = ui.send_blocking(UiMsg::Status(format!("Starting session {session}…")));
+    std::thread::spawn(move || {
+        let output = std::process::Command::new(cmux_tui())
+            .args(["server", "ensure", "--session", &session])
+            .stdin(std::process::Stdio::null())
+            .output();
+        let message = match output {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => format!(
+                "Couldn't start session {session}: {}",
+                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("cmux-tui failed")
+            ),
+            Err(error) => format!("Couldn't run {}: {error}", cmux_tui().display()),
+        };
+        let _ = ui.send_blocking(UiMsg::Status(message));
+    });
+}
+
 fn cmux_theme() -> PathBuf {
     let on_path = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path).map(|d| d.join("cmux-theme")).find(|p| p.is_file())
@@ -869,6 +910,7 @@ fn build_main_menu() -> gio::Menu {
     look.append(Some("Workspaces / Files (Ctrl+Shift+F)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
     let workspace = gio::Menu::new();
+    workspace.append(Some("Start session"), Some("app.start-session"));
     workspace.append(Some("New workspace"), Some("app.new-workspace"));
     workspace.append(Some("Rename workspace…"), Some("app.rename-this-workspace"));
     workspace.append(Some("Close workspace…"), Some("app.close-this-workspace"));
@@ -877,7 +919,17 @@ fn build_main_menu() -> gio::Menu {
 }
 
 /// App actions behind the main menu and the sidebar's right-click menu.
-fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui) {
+fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session: &str) {
+    let start = gio::SimpleAction::new("start-session", None);
+    start.connect_activate({
+        let (state, session) = (state.clone(), session.to_string());
+        move |_, _| {
+            let ui_tx = state.borrow().ui_tx.clone();
+            ensure_session(&session, ui_tx);
+        }
+    });
+    app.add_action(&start);
+
     // Theme: a radio group whose state is the active cmux theme. Switching
     // runs `cmux-theme set`, the same as the TUI's picker: it rewrites the
     // config and the Ghostty colour block, reloads every session (terminals
