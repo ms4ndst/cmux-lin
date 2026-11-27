@@ -28,6 +28,8 @@
 //! shuts down when that pipe closes, the kernel closes our end whenever this
 //! process dies, and the pipe is inherited straight through launchers.
 
+
+pub mod cookies;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -562,9 +564,18 @@ pub fn evaluate(socket_path: &Path, tab_id: &str, expression: &str) -> Result<Va
     }
 }
 
-/// Open a DevTools connection to the page of browser tab `tab_id`, using the
-/// endpoint and target the session's provider registered. Loopback only.
-fn page_socket(socket_path: &Path, tab_id: &str) -> Result<PageSocket, String> {
+/// The URL of the browser's own DevTools front-end for browser tab
+/// `tab_id`, served by the provider's browser on loopback
+/// (`http://127.0.0.1:PORT/devtools/inspector.html?ws=…`). Open it in
+/// another browser tab of the same session to inspect the page.
+pub fn devtools_url(socket_path: &Path, tab_id: &str) -> Result<String, String> {
+    let (authority, target) = page_target(socket_path, tab_id)?;
+    Ok(format!("http://{authority}/devtools/inspector.html?ws={authority}/devtools/page/{target}"))
+}
+
+/// The loopback DevTools authority (`127.0.0.1:PORT`) and page target of
+/// browser tab `tab_id`, from what the session's provider registered.
+fn page_target(socket_path: &Path, tab_id: &str) -> Result<(String, String), String> {
     let mut session = Session::connect(socket_path).map_err(|e| e.to_string())?;
     let provider = session.request(json!({ "cmd": "get-browser-provider" }))?;
     if provider.get("available") != Some(&Value::Bool(true)) {
@@ -593,9 +604,18 @@ fn page_socket(socket_path: &Path, tab_id: &str) -> Result<PageSocket, String> {
         [port, host] => (port.parse::<u16>().map_err(|_| "bad endpoint port")?, *host),
         _ => return Err("unexpected provider endpoint".into()),
     };
-    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" || port == 0 {
         return Err("refusing a non-loopback DevTools endpoint".into());
     }
+    Ok((authority.to_string(), target))
+}
+
+/// Open a DevTools connection to the page of browser tab `tab_id`, using the
+/// endpoint and target the session's provider registered. Loopback only.
+fn page_socket(socket_path: &Path, tab_id: &str) -> Result<PageSocket, String> {
+    let (authority, target) = page_target(socket_path, tab_id)?;
+    let (host, port) = authority.rsplit_once(':').ok_or("unexpected provider endpoint")?;
+    let port: u16 = port.parse().map_err(|_| "bad endpoint port")?;
     let url = format!("ws://{authority}/devtools/page/{target}");
     let stream = TcpStream::connect((host.trim_matches(|c| c == '[' || c == ']'), port)).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
