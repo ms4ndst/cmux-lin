@@ -3798,14 +3798,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let state = state.clone();
-        move |_| {
-            // Client-local, like the rest of the selection.
-            let changed = state.borrow().focused != Some(id);
-            if changed {
-                state.borrow_mut().focused = Some(id);
-                update_focus_marks(&state);
-            }
-        }
+        move |_| note_focused(&state, id)
     });
     term.add_controller(focus);
 
@@ -3861,12 +3854,7 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
     let web_focus = gtk::EventControllerFocus::new();
     web_focus.connect_enter({
         let state = state.clone();
-        move |_| {
-            if state.borrow().focused != Some(id) {
-                state.borrow_mut().focused = Some(id);
-                update_focus_marks(&state);
-            }
-        }
+        move |_| note_focused(&state, id)
     });
     web.root.add_controller(web_focus);
 
@@ -3903,6 +3891,22 @@ fn new_pane_view(state: &Shared, id: u64) -> PaneView {
         reported: None,
         drawn: None,
     }
+}
+
+/// Pane `id` got keyboard focus: make it the shortcut target (client-local,
+/// like the rest of the selection). Focus can move while the state is being
+/// changed (closing a focused browser tab hands focus to the terminal in the
+/// middle of a redraw), so this runs from the idle loop, not inside the
+/// focus signal.
+fn note_focused(state: &Shared, id: u64) {
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        let changed = state.borrow().focused != Some(id);
+        if changed {
+            state.borrow_mut().focused = Some(id);
+            update_focus_marks(&state);
+        }
+    });
 }
 
 /// Redraw a pane's tab strip if its tabs changed, and attach to its active
