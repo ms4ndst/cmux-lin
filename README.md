@@ -4,7 +4,7 @@ Reproducible Linux build of **cmux** — [manaflow-ai/cmux](https://github.com/m
 
 > Unofficial. All of the multiplexer is upstream cmux by [manaflow-ai](https://github.com/manaflow-ai), built on [Ghostty](https://github.com/ghostty-org/ghostty); see [Credits](#credits).
 
-![The cmux-gtk window: workspaces with agent badges, a split screen, and the agents queue](docs/screenshots/overview.png)
+![The cmux-gtk window: workspaces with descriptions, agent badges, branch and port, a split screen, and the agents queue](docs/screenshots/overview.png)
 
 Upstream cmux ships a native macOS app (Swift/AppKit on libghostty). That app can't be ported in a build script. What does run on Linux is `cmux-tui`, the Rust multiplexer that keeps sessions, workspaces, screens, panes, tabs, terminals and browsers, with a sidebar, agent hooks and notifications. This repo:
 
@@ -18,7 +18,8 @@ Status on Fedora 44 (x86_64), verified 2026-11-27:
 - `30-build.sh` builds `cmux-tui` (Zig 0.16.0 builds `libghostty-vt.a`, Ghostty's VT core), the browser provider, and the GTK app when its libraries are present.
 - `cmux` starts or attaches a durable session; `cmux server start` runs one headless; the TUI restores the session's layout across restarts.
 - The noun-first CLI (`cmux workspace create`, `cmux terminal list`, …) works against the running session.
-- cmux-gtk drives the same session: workspaces, screens, splits, tabs, browser tabs, agent badges and desktop notifications.
+- cmux-gtk drives the same session: workspaces, screens, splits, tabs and browser tabs, agent badges and notifications, a command palette, settings, an SSH view, DevTools and cookie import (see [The GTK window](#the-gtk-window)).
+- `40-install.sh` installs shell completions; `50-package-rpm.sh` builds an installable RPM.
 
 | Part | Included here | Notes |
 |---|---|---|
@@ -32,10 +33,12 @@ Status on Fedora 44 (x86_64), verified 2026-11-27:
 
 | | |
 |---|---|
-| ![A browser tab with the live upstream repo page beside an agent's terminal](docs/screenshots/browser-tab.png) | ![The files view following the focused terminal's folder](docs/screenshots/files-view.png) |
-| A browser tab beside an agent | The files sidebar view |
-| ![The same window in the light Latte theme](docs/screenshots/light-theme.png) | |
-| The window follows the theme (here Latte) | |
+| ![The command palette with custom commands, workspaces and tabs](docs/screenshots/palette.png) | ![A browser tab showing a page served by the workspace's dev server](docs/screenshots/browser-tab.png) |
+| The command palette | A browser tab beside the dev server's tests |
+| ![DevTools beside the page they inspect](docs/screenshots/devtools.png) | ![The settings window](docs/screenshots/settings.png) |
+| DevTools beside the page | Settings |
+| ![The same window in the light Latte theme](docs/screenshots/light-theme.png) | ![The files view following the focused terminal's folder](docs/screenshots/files-view.png) |
+| The window follows the theme (here Latte) | The files sidebar view |
 
 The screenshots come from a demo session with made-up content.
 
@@ -125,7 +128,7 @@ cmux browser tabs (`Ctrl-b B` in the TUI, 🌐 in the window) are real Chromium 
 - cmux-gtk runs one built in.
 - For the TUI on its own, run `cmux-browser-provider --session main` alongside the session (Ctrl-C to stop).
 
-It needs a Chromium-based browser, but only when a browser tab exists: Chromium (`sudo dnf install chromium`), Brave or Edge, with Google Chrome as a last resort, or whatever `CMUX_LIN_BROWSER` names. It runs the browser headless with its own profile under `~/.local/share/cmux-lin/browsers/`, and the browser always exits with the provider. Terminals never need it. Details: [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md#browser-tabs).
+It needs a Chromium-based browser, but only when a browser tab exists: Chromium (`sudo dnf install chromium`), Brave or Edge, with Google Chrome as a last resort, or whatever `CMUX_LIN_BROWSER` names. It runs the browser headless with its own profile under `~/.local/share/cmux-lin/browsers/`, and the browser always exits with the provider. Terminals never need it. In cmux-gtk you can pick the browser in Settings, open DevTools for a page (`F12`), and import cookies from your other browsers so browser tabs start logged in. Details: [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md#browser-tabs).
 
 ### Quitting a session
 

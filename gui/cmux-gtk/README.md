@@ -2,16 +2,18 @@
 
 A native GTK4 window for a cmux session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses).
 
-![The cmux-gtk window: workspaces with agent badges, a split screen, and the agents queue](../../docs/screenshots/overview.png)
+![The cmux-gtk window: workspaces with descriptions, agent badges, branch and port, a split screen, and the agents queue](../../docs/screenshots/overview.png)
 
 The cmux-tui server stays in charge of everything, and this window is just another client of it. The TUI, this window and agents all see the same workspaces, terminals and browser pages. All layout changes (splits, tabs, moves, zoom, names) are requests to the server, and the window redraws from the tree the server reports back, so its layout can't drift from the TUI's. Only the selection belongs to the window: which workspace, screen, tab and pane you're looking at is this window's alone, as in upstream's design. Switching here doesn't move the TUI or another window, and switching there doesn't move this one. Things just created (a new workspace, screen or tab, including one a tab was moved into) come into view.
 
 | | |
 |---|---|
-| ![A browser tab with the live upstream repo page beside an agent's terminal](../../docs/screenshots/browser-tab.png) | ![The files view following the focused terminal's folder](../../docs/screenshots/files-view.png) |
-| [Browser tabs](#browser-tabs) | The [Files](#sidebar) view |
-| ![The same window in the light Latte theme](../../docs/screenshots/light-theme.png) | |
-| Following the Latte theme | |
+| ![The command palette with custom commands, workspaces and tabs](../../docs/screenshots/palette.png) | ![A browser tab showing a page served by the workspace's dev server](../../docs/screenshots/browser-tab.png) |
+| [Command palette](#command-palette) | [Browser tabs](#browser-tabs) |
+| ![DevTools beside the page they inspect](../../docs/screenshots/devtools.png) | ![The settings window](../../docs/screenshots/settings.png) |
+| [DevTools](#devtools) | [Settings](#settings) |
+| ![The same window in the light Latte theme](../../docs/screenshots/light-theme.png) | ![The files view following the focused terminal's folder](../../docs/screenshots/files-view.png) |
+| Following the Latte theme | The [Files](#sidebar) view |
 
 ## Install
 
@@ -24,7 +26,7 @@ cmux-gtk --session work     # another session, in its own window
 
 Each session gets its own window (app id `dev.cmuxlin.CmuxGtk.<session>`). `cmux-gtk --session work` opens beside the `main` window, and opening a session that already has a window brings that window up.
 
-If the session isn't running (after a reboot, say), the window starts it, like plain `cmux` does (`cmux server ensure`), and connects. A session that stops while the window is open stays stopped; ☰ → **Start session** brings it back. If the session restarts, the window dims and waits, then reconnects by itself and re-attaches every pane.
+If the session isn't running (after a reboot, say), the window starts it, like plain `cmux` does (`cmux server ensure`), and connects. You can turn that off in Settings. A session that stops while the window is open stays stopped; ☰ → **Start session** brings it back. If the session restarts, the window dims and waits, then reconnects by itself and re-attaches every pane.
 
 ## Workspaces, screens and panes
 
@@ -324,7 +326,13 @@ gdbus call --session --dest dev.cmuxlin.CmuxGtk.main --object-path /dev/cmuxlin/
 ## Requirements
 
 - **Always:** cmux-tui (the window starts the session if needed), plus `gtk4-devel` and `vte291-gtk4-devel` to build.
-- **Only for browser tabs:** a Chromium-based browser, for example Chromium (`sudo dnf install chromium`), Brave or Microsoft Edge. Google Chrome works too, but it's only used if nothing else is installed, because it reports usage to Google even when run headless. Firefox can't be used: cmux talks to pages over the Chrome DevTools Protocol, which Firefox no longer supports. Without one, everything else works, and a browser tab says what's missing instead of showing a page.
+- **Only for browser tabs:** a Chromium-based browser, for example Chromium (`sudo dnf install chromium`), Brave or Microsoft Edge. Google Chrome works too, but it's only used if nothing else is installed, because it reports usage to Google even when run headless. Firefox can't run browser tabs: cmux talks to pages over the Chrome DevTools Protocol, which Firefox no longer supports. Firefox cookies can still be imported. Without a Chromium-based browser, everything else works, and a browser tab says what's missing instead of showing a page.
+- **Optional, for single features:**
+  - `gh`, logged in, for pull request status;
+  - `secret-tool` (package `libsecret`) to import cookies from Chromium-family browsers;
+  - `ssh` for the SSH view.
+
+  Each feature simply stays empty without its tool.
 
 ## Build from source
 
@@ -347,6 +355,13 @@ The tree is re-read every 1.5 s and straight after every action. If a tree poll 
 
 A third connection subscribes to session events. `notification` events become desktop notifications, and tree, agent and notification events trigger an immediate re-poll of the tree and the agent roster (`list-agents`), so badges update within a moment rather than on the next poll.
 
+A few more workers run beside these, each on its own connection:
+
+- **Notification panel.** The control thread reads the notification list over the session's resource protocol (`cmux.protocol/2`), which has the list, ack and clear operations the older commands lack.
+- **Workspace details.** A thread works out each workspace's folder, git branch, pull request and listening ports every 3 seconds (see [Branch and ports](#branch-and-ports)).
+- **Multi-step actions.** Workspace layout commands, pane moves, SSH workspaces and DevTools are each built step by step on a short-lived thread, then the window shows the result.
+- **Browser provider.** The built-in provider runs in its own thread too, with the headless browser as a child process.
+
 Terminal colours come from the active theme itself: the `~/.config/ghostty/config` block `cmux-theme` writes, which is also what the server loads. The window reads it directly and re-colours every terminal as soon as it changes, so a theme switch shows at once whatever colours the server is holding. A program's own colour changes (OSC 10/11/12 and OSC 4, which the server reports as overrides) still win. After that comes a legibility guard: text gets at least 4.5:1 contrast against the background and ANSI colours 1–15 at least 3:1, each nudged toward white or black only as far as needed, so a theme with low-contrast pairs stays readable. Colour 0 is left as is, because it's mostly used as a background. Colours a program prints in fixed RGB, such as powerline prompt segments, keep their literal values, as in any terminal.
 
 ## Not done
@@ -356,5 +371,24 @@ Terminal colours come from the active theme itself: the `~/.config/ghostty/confi
 
 ## Debugging
 
-- `CMUX_GTK_SNAPSHOT=/abs/path.png` renders the window to that PNG every 2 s, without screen capture, plus `path-notes.png` while the notification panel is open.
-- `CMUX_GTK_DEBUG=1` logs per-pane size reports to stderr.
+- `CMUX_GTK_SNAPSHOT=/abs/path.png` renders the window to that PNG every 2 s without screen capture. It adds `path-notes.png` while the notification panel is open and `path-settings.png` while the settings window is open.
+- `CMUX_GTK_DEBUG=1` logs size reports, acknowledgements and find results to stderr.
+- `CMUX_GTK_NO_PROVIDER=1` runs without the built-in browser provider.
+
+## Scripting
+
+Every window is reachable over D-Bus at `dev.cmuxlin.CmuxGtk.<session>`, object path `/dev/cmuxlin/CmuxGtk/<session>`, through the standard `org.gtk.Actions` interface. Besides the menu actions (`app.settings`, `app.palette`, `app.notifications`, `app.find`, `app.devtools`, `app.theme`, …), these take an argument:
+
+| Action | Argument | Does |
+|---|---|---|
+| `app.nav` | string | `workspace-N`, `workspace-next`/`-prev`, `tab-N`, `tab-next`/`-prev`, `focus-<dir>`, `resize-<dir>`, `flash` |
+| `app.palette-run` | string | runs the best palette match for the text |
+| `app.palette-text` | string | opens the palette with the text typed |
+| `app.find-text` | string | opens Find in the focused terminal and searches |
+| `app.show-surface` | uint64 | shows the tab with that surface id |
+| `app.open-session` | string | opens that session's window |
+
+```bash
+gdbus call --session --dest dev.cmuxlin.CmuxGtk.main --object-path /dev/cmuxlin/CmuxGtk/main \
+  --method org.gtk.Actions.Activate palette-run '[<"go to workspace api">]' '{}'
+```
