@@ -211,6 +211,8 @@ pub enum UiMsg {
     Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
     /// The retained notifications changed (or were read for the first time).
     Notes(Vec<Note>),
+    /// Workspace details (directory, git branch, listening ports) changed.
+    Meta(std::collections::HashMap<u64, crate::meta::WsMeta>),
     /// Output for the attachment with this `generation` (unique across all
     /// panes); events from replaced attachments are dropped by the UI.
     Attach { generation: u64, event: AttachEvent },

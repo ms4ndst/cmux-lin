@@ -124,8 +124,16 @@ The panel reads the notifications through the session's resource protocol (`noti
 
 Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+Y`:
 
-- **Workspaces**, with the **Agents** queue underneath while agents run: every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
+- **Workspaces**: each row shows the workspace's name, its active tab's title and, when there are any, the git branch of that tab's folder and the TCP ports the workspace's programs listen on (`⎇ main  ·  :3000 :5173`). Hover a row for the full folder. While agents run, the **Agents** queue sits underneath, listing every agent across all workspaces, blocked first, then finished, working, idle, unknown, the most recent change first within each. Each row shows the tab's name and its workspace; click one to jump to its tab.
 - **Files**: a browser on the focused terminal's working directory, following it as you `cd` (asked from the session with `process-info`) until you navigate yourself; `~` follows again. Double-click or Enter opens a folder, or a file in `$EDITOR` in a new tab. `c` (or the `cd` button) changes the focused pane to the selected folder, `o` opens `.md`/`.html` in a browser tab, `.` shows dotfiles, Backspace goes up, and the field filters by name.
+
+### Branch and ports
+
+The server doesn't track branches or ports, so the window works them out itself every 3 seconds, since it runs on the same machine as the session:
+
+- `process-info` gives each terminal's shell process and working folder (the foreground program's, if it reports one).
+- The branch is read from the repository around the active terminal's folder (`.git/HEAD`, worktrees included; a detached head shows its short commit id). No `git` process is run.
+- Ports are the listening TCP sockets (`/proc/net/tcp` and `tcp6`) held by any terminal's shell in the workspace, or by anything started under it. A program that detaches from its shell (a daemon) isn't counted.
 
 ## Keyboard shortcuts
 

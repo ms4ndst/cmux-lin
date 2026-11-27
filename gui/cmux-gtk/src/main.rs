@@ -32,6 +32,7 @@ mod backend;
 mod browser;
 mod files;
 mod find;
+mod meta;
 mod notes;
 mod theme;
 
@@ -84,6 +85,7 @@ const CSS: &str = "
 .notes-count { font-weight: bold; font-size: smaller; }
 .find-bar { padding: 2px 4px; }
 .pane.flash { box-shadow: inset 0 0 0 3px @accent_color; }
+.ws-details { opacity: 0.85; }
 .find-bar entry.error { color: @error_color; }
 ";
 
@@ -211,6 +213,10 @@ struct State {
     notes: Vec<backend::Note>,
     /// Terminal text size, relative to the font (Ctrl+plus / minus / 0).
     font_scale: f64,
+    /// Workspace details for the sidebar (branch, ports), by workspace id,
+    /// and the workspaces the background thread should look at.
+    meta: HashMap<u64, meta::WsMeta>,
+    meta_targets: meta::Targets,
 }
 
 impl State {
@@ -445,6 +451,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let socket_path = config.socket_path.clone();
     backend::spawn_control(config, session.to_string(), ctl_rx, ui_tx.clone());
     backend::spawn_events(socket_path.clone(), ctl_tx.clone(), ui_tx.clone());
+    let meta_targets: meta::Targets = Default::default();
+    meta::spawn(socket_path.clone(), meta_targets.clone(), ui_tx.clone());
     // Start the session if it isn't running (after a reboot nothing else
     // does), like plain `cmux`. Only at launch: a session that stops while
     // the window is open (Ctrl-b Q) stays stopped; ☰ → Start session
@@ -481,6 +489,8 @@ fn build_ui(app: &gtk::Application, session: &str) {
         browser_problem: None,
         notes: Vec::new(),
         font_scale: load_font_scale(),
+        meta: HashMap::new(),
+        meta_targets: meta_targets.clone(),
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -695,6 +705,10 @@ fn build_ui(app: &gtk::Application, session: &str) {
                         state.borrow_mut().agents = agents;
                         on_tree(&state, &ui, workspaces);
                         draw_notes(&state, &ui);
+                    }
+                    UiMsg::Meta(meta) => {
+                        state.borrow_mut().meta = meta;
+                        draw_sidebar(&state, &ui);
                     }
                     UiMsg::Notes(notes) => {
                         state.borrow_mut().notes = notes;
@@ -1470,7 +1484,7 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
     // Follow the shared defaults only for things that are new since the last
     // tree (created here or elsewhere and made active by the server: a new
     // workspace, screen or tab); otherwise keep this window's own choices.
-    let target = {
+    {
         let mut st = state.borrow_mut();
         let first = st.known.is_none();
         let (old_ws, old_screens, old_tabs) = st.known.take().unwrap_or_default();
@@ -1511,25 +1525,51 @@ fn on_tree(state: &Shared, ui: &Ui, workspaces: Vec<Workspace>) {
         st.selected = target.map(|i| workspaces[i].id);
         st.raw = workspaces;
         st.workspaces = apply_choices(&st.raw, &st.screen_choice, &st.tab_choice);
-        target
-    };
-    let workspaces = state.borrow().workspaces.clone();
+    }
+    // Tell the details thread which terminals to look at: each workspace's
+    // active terminal (directory, branch) and all of them (ports).
+    {
+        let st = state.borrow();
+        let targets: Vec<meta::Target> = st
+            .raw
+            .iter()
+            .map(|ws| {
+                let terminals: Vec<u64> = ws.all_tabs().filter(|t| t.terminal).map(|t| t.surface).collect();
+                let primary = ws
+                    .active_pane
+                    .and_then(|id| ws.panes.iter().find(|p| p.id == id))
+                    .and_then(|p| p.active())
+                    .filter(|t| t.terminal)
+                    .map(|t| t.surface)
+                    .or_else(|| terminals.first().copied());
+                meta::Target { workspace: ws.id, primary, surfaces: terminals }
+            })
+            .collect();
+        if let Ok(mut current) = st.meta_targets.lock() {
+            *current = targets;
+        }
+    }
+    draw_sidebar(state, ui);
+    draw_agents(state, ui);
+    render(state, ui);
+}
 
-    // Rebuild the sidebar rows. Selecting a row fires `row-selected`, whose
-    // handler sees `selected` already set and does nothing.
-    // Only rows: the placeholder and any rename popover stay.
+/// Rebuild the sidebar rows. Selecting a row fires `row-selected`, whose
+/// handler sees `selected` already set and does nothing. Only rows go: the
+/// placeholder and any rename popover stay.
+fn draw_sidebar(state: &Shared, ui: &Ui) {
     for child in content_children(&ui.list).into_iter().filter(|c| c.is::<gtk::ListBoxRow>()) {
         ui.list.remove(&child);
     }
-    for ws in &workspaces {
-        let row = sidebar_row(ws, &state.borrow().agents);
-        ui.list.append(&row);
+    let st = state.borrow();
+    for ws in &st.workspaces {
+        ui.list.append(&sidebar_row(ws, &st.agents, st.meta.get(&ws.id)));
     }
+    let target = st.workspaces.iter().position(|w| Some(w.id) == st.selected);
+    drop(st);
     if let Some(row) = target.and_then(|i| ui.list.row_at_index(i as i32)) {
         ui.list.select_row(Some(&row));
     }
-    draw_agents(state, ui);
-    render(state, ui);
 }
 
 /// The agents queue: every agent across all workspaces, blocked first, then
@@ -2024,7 +2064,7 @@ fn draw_screens(state: &Shared, ui: &Ui, ws: Option<&Workspace>) {
     ui.screens.append(&add);
 }
 
-fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
+fn sidebar_row(ws: &Workspace, agents: &Agents, meta: Option<&meta::WsMeta>) -> gtk::Box {
     let name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
     let title = gtk::Label::new(Some(&name));
     title.set_xalign(0.0);
@@ -2040,6 +2080,38 @@ fn sidebar_row(ws: &Workspace, agents: &Agents) -> gtk::Box {
     column.append(&title);
     column.append(&subtitle);
     column.set_hexpand(true);
+    // Git branch and listening ports, when there are any.
+    if let Some(meta) = meta {
+        let mut parts = Vec::new();
+        if let Some(branch) = &meta.branch {
+            parts.push(format!("⎇ {branch}"));
+        }
+        if !meta.ports.is_empty() {
+            parts.push(meta.ports.iter().map(|p| format!(":{p}")).collect::<Vec<_>>().join(" "));
+        }
+        if !parts.is_empty() {
+            let details = gtk::Label::new(Some(&parts.join("  ·  ")));
+            details.set_xalign(0.0);
+            details.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            details.add_css_class("caption");
+            details.add_css_class("ws-details");
+            column.append(&details);
+        }
+        let mut tip = Vec::new();
+        if let Some(cwd) = &meta.cwd {
+            tip.push(cwd.clone());
+        }
+        if let Some(branch) = &meta.branch {
+            tip.push(format!("Branch: {branch}"));
+        }
+        if !meta.ports.is_empty() {
+            let ports: Vec<String> = meta.ports.iter().map(u16::to_string).collect();
+            tip.push(format!("Listening on port {}", ports.join(", ")));
+        }
+        if !tip.is_empty() {
+            column.set_tooltip_text(Some(&tip.join("\n")));
+        }
+    }
 
     // The workspace's most urgent state, and how many tabs need you.
     let states: Vec<Attn> =
