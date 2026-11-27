@@ -59,7 +59,7 @@ Terminal text stays legible in any theme; see [How it works](#how-it-works).
 
 ## The ☰ menu
 
-**Start session**, **Theme**, the Workspaces/Files switch, and New / Rename / Close workspace.
+**Start session**, **Theme**, the Workspaces/Files switch, the notification actions, and New / Rename / Close workspace.
 
 ## Browser tabs
 
@@ -105,6 +105,19 @@ When a tab with a finished turn or an unread notification is on screen and the w
 
 Notifications also go to the desktop notification service (dunst, GNOME Shell and so on), unless you're already looking at that terminal. Clicking one jumps to its tab. The latest notification also shows in the status line for a few seconds.
 
+### Notification panel
+
+The bell in the header bar shows how many notifications are unread and opens the panel (`Ctrl+Shift+I`). It lists every notification the session keeps (up to 256), newest first. Each row shows its level mark, title, body, workspace and tab, and how long ago it arrived. Unread rows have a filled mark and a bold title.
+
+- Click a row to jump to its tab. Seeing the tab marks its notifications read, as it does in the TUI.
+- `Ctrl+Shift+J` jumps to the tab of the newest unread notification.
+- **Mark all read** clears every unread marker, as if you had looked at each tab.
+- **Clear all** deletes the session's notifications, for every window and the TUI.
+
+The same actions are in the ☰ menu. A notification whose tab has closed stays in the list, marked "tab closed", until it's cleared.
+
+The panel reads the notifications through the session's resource protocol (`notification.list`, `notification.ack`, `notification.clear`). Seeing a tab clears its marker for every client. When the window sees a notification become read, it also records it as read by this window (`read_by`), because a new notification on the same terminal re-flags the older ones as unread on the server.
+
 ## Sidebar
 
 Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shift+F`:
@@ -114,7 +127,7 @@ Like the TUI's, the sidebar has two views, switched at its top or with `Ctrl+Shi
 
 ## Keyboard shortcuts
 
-They act on the pane you're typing in:
+They act on the pane you're typing in (the notification keys work anywhere):
 
 | Keys | Action |
 |---|---|
@@ -128,6 +141,8 @@ They act on the pane you're typing in:
 | `Ctrl+Shift+U` | Undo the screen's last layout change |
 | `Ctrl+Shift+G` | New column to the right (viewport columns) |
 | `Ctrl+Shift+F` | Sidebar: Workspaces / Files |
+| `Ctrl+Shift+I` | Notification panel |
+| `Ctrl+Shift+J` | Jump to the latest unread notification |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in a terminal pane (also `Shift+Insert`) |
 | `Ctrl+Shift+N` | New screen |
 | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Next / previous screen |
@@ -167,5 +182,5 @@ Terminal colours come from the active theme itself: the `~/.config/ghostty/confi
 
 ## Debugging
 
-- `CMUX_GTK_SNAPSHOT=/abs/path.png` renders the window to that PNG every 2 s, without screen capture.
+- `CMUX_GTK_SNAPSHOT=/abs/path.png` renders the window to that PNG every 2 s, without screen capture, plus `path-notes.png` while the notification panel is open.
 - `CMUX_GTK_DEBUG=1` logs per-pane size reports to stderr.

@@ -7,6 +7,10 @@
 //! - one event thread subscribes to session events: notifications become
 //!   [`UiMsg::Notification`], and tree/agent/notification events make the
 //!   control thread re-poll at once;
+//! - the control thread also reads the retained notifications for the
+//!   notification panel ([`UiMsg::Notes`]) over a second connection that
+//!   speaks the resource protocol (`cmux.protocol/2`), which has the
+//!   notification list, ack and clear operations the old commands lack;
 //! - one [`Attachment`] per viewed terminal owns a byte-mode attach
 //!   connection. Its reader forwards the VT replay and live output to the UI;
 //!   its writer sends input and size reports **on that same connection**.
@@ -22,7 +26,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -156,6 +160,29 @@ pub struct Agent {
 /// Agents by terminal surface.
 pub type Agents = std::collections::HashMap<u64, Agent>;
 
+/// A notification the session retains (`notification.list`), for the
+/// notification panel. Newest first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub id: String,
+    /// The tab showing its terminal (`tab_…`, the tree's `tab_resource_id`),
+    /// or `None` once that terminal has no tab.
+    pub tab_id: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// `info`, `warning` or `error`.
+    pub level: String,
+    /// When it was posted (ms since the epoch).
+    pub created_at: u64,
+    /// Nobody has looked at its tab since (the shared marker, which every
+    /// client clears by showing the tab), and this window hasn't marked it
+    /// read either.
+    pub unread: bool,
+}
+
+/// This window's identity in a notification's per-client `read_by`.
+pub const CLIENT_ID: &str = "cmux-gtk";
+
 /// Messages from workers to the UI.
 pub enum UiMsg {
     /// The session answered again (first contact, or after a restart).
@@ -182,6 +209,8 @@ pub enum UiMsg {
     ContextMenu { generation: u64, x: f64, y: f64, link: Option<String> },
     /// A posted notification (from `notify`, an agent hook, or the mux).
     Notification { id: u64, title: String, body: String, level: String, surface: Option<u64> },
+    /// The retained notifications changed (or were read for the first time).
+    Notes(Vec<Note>),
     /// Output for the attachment with this `generation` (unique across all
     /// panes); events from replaced attachments are dropped by the UI.
     Attach { generation: u64, event: AttachEvent },
@@ -226,6 +255,13 @@ pub enum Ctl {
     /// Undo the latest layout change on `pane`'s screen; `confirm` is the
     /// preview revision when confirming an undo that closes panes.
     Undo { pane: u64, confirm: Option<u64> },
+    /// Mark these notifications read for this window (`notification.ack`).
+    /// Those whose tab still exists are also acknowledged by tab, which
+    /// clears them for every client.
+    NotesRead(Vec<String>),
+    /// Delete every retained notification (`notification.clear`), which also
+    /// clears the tabs' unread markers.
+    NotesClear,
     /// Any protocol command as a JSON object with `cmd` (e.g. `split`,
     /// `new-tab`, `select-tab`, `close-surface`, `focus-pane`).
     Request(Value),
@@ -247,12 +283,12 @@ pub fn config_for(session: &str) -> Result<ClientConfig, Error> {
 /// whenever a poll fails (the server stopped or restarted), the UI gets
 /// [`UiMsg::Disconnected`] once and the thread retries every second.
 /// Requests sent while disconnected are dropped (the UI greys itself out).
-pub fn spawn_control(config: ClientConfig, rx: Receiver<Ctl>, ui: async_channel::Sender<UiMsg>) {
+pub fn spawn_control(config: ClientConfig, session: String, rx: Receiver<Ctl>, ui: async_channel::Sender<UiMsg>) {
     std::thread::spawn(move || {
         let mut announced_down = false;
         loop {
             let (lost, was_up) = match Client::connect(config.clone()) {
-                Ok(mut client) => match serve(&mut client, &rx, &ui) {
+                Ok(mut client) => match serve(&mut client, &session, &rx, &ui) {
                     Served::UiGone => return,
                     Served::Lost { reason, was_up } => (reason, was_up),
                 },
@@ -285,8 +321,10 @@ enum Served {
 }
 
 /// Poll and run requests on one connection until it fails.
-fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiMsg>) -> Served {
+fn serve(client: &mut Client, session: &str, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiMsg>) -> Served {
     let mut last: Option<(Vec<Workspace>, Agents)> = None;
+    let socket_path = client.config().socket_path.clone();
+    let mut notes = Notes { path: socket_path, session: session.to_string(), conn: None, last: None };
     loop {
         let snapshot = list_workspaces(client).and_then(|workspaces| Ok((workspaces, list_agents(client)?)));
         match snapshot {
@@ -303,6 +341,11 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             }
             Err(error) => return Served::Lost { reason: error.to_string(), was_up: last.is_some() },
         }
+        if let Some(changed) = notes.poll() {
+            if ui.send_blocking(UiMsg::Notes(changed)).is_err() {
+                return Served::UiGone;
+            }
+        }
         // Wait for a request or the next poll. Run everything queued (a burst
         // of events coalesces into one re-poll), then loop straight back to
         // re-read the tree so the UI updates at once.
@@ -315,6 +358,14 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             let result = match ctl {
                 Ctl::Poke => Ok(()),
                 Ctl::Undo { pane, confirm } => undo_layout(client, ui, pane, confirm),
+                Ctl::NotesRead(ids) => {
+                    notes.mutate("notification.ack", json!({ "client_id": CLIENT_ID, "notifications": ids }), ui);
+                    Ok(())
+                }
+                Ctl::NotesClear => {
+                    notes.mutate("notification.clear", json!({}), ui);
+                    Ok(())
+                }
                 Ctl::Close { request, terminals } => {
                     let closed = match request {
                         Value::Object(request) => client.request_raw(request).map(|_| ()),
@@ -358,6 +409,187 @@ fn serve(client: &mut Client, rx: &Receiver<Ctl>, ui: &async_channel::Sender<UiM
             if let Err(error) = result {
                 let _ = ui.send_blocking(UiMsg::Status(format!("request failed: {error}")));
             }
+        }
+    }
+}
+
+/// The notification panel's source: a resource-protocol connection, opened
+/// on demand and dropped on any failure (the next poll reopens it). Its
+/// failures never take the window offline; the tree poll decides that.
+struct Notes {
+    path: PathBuf,
+    session: String,
+    conn: Option<V2>,
+    last: Option<Vec<Note>>,
+}
+
+impl Notes {
+    /// Re-read the notifications; `Some` when they changed.
+    ///
+    /// A notification someone has seen (the shared marker cleared) is also
+    /// recorded as read by this window (`notification.ack`). The shared flag
+    /// comes back for every notification of a terminal when a new one
+    /// arrives there, so without the record already-seen ones would count
+    /// as unread again.
+    fn poll(&mut self) -> Option<Vec<Note>> {
+        let read = self.with_conn(|conn, session| read_notes(conn, session));
+        let (mut notes, seen) = read?;
+        if !seen.is_empty() {
+            let recorded = self.with_conn(|conn, session| {
+                conn.call("notification.ack", json!({ "session": session, "client_id": CLIENT_ID, "notifications": seen }), true)
+            });
+            // Re-read once so `read_by` reflects it.
+            if recorded.is_some() {
+                notes = self.with_conn(|conn, session| read_notes(conn, session))?.0;
+            }
+        }
+        if self.last.as_ref() == Some(&notes) {
+            return None;
+        }
+        self.last = Some(notes.clone());
+        Some(notes)
+    }
+
+    /// Run a notification mutation; failures go to the status line.
+    fn mutate(&mut self, operation: &str, fields: Value, ui: &async_channel::Sender<UiMsg>) {
+        let result = self.with_conn(|conn, session| {
+            let mut params = fields.clone();
+            params["session"] = json!(session);
+            conn.call(operation, params, true)
+        });
+        if result.is_none() {
+            let _ = ui.send_blocking(UiMsg::Status(format!("{operation} failed")));
+        }
+    }
+
+    fn with_conn<T>(&mut self, run: impl FnOnce(&mut V2, &str) -> Result<T, String>) -> Option<T> {
+        if self.conn.is_none() {
+            self.conn = V2::connect(&self.path).ok();
+        }
+        let conn = self.conn.as_mut()?;
+        match run(conn, &self.session) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if std::env::var_os("CMUX_GTK_DEBUG").is_some() {
+                    eprintln!("cmux-gtk: notifications: {error}");
+                }
+                self.conn = None;
+                None
+            }
+        }
+    }
+}
+
+/// The session's notifications, newest first, each with the tab that shows
+/// its terminal; plus the ids someone has seen that aren't yet recorded as
+/// read by this window.
+fn read_notes(conn: &mut V2, session: &str) -> Result<(Vec<Note>, Vec<String>), String> {
+    let list = conn.call("notification.list", json!({ "session": session, "limit": 256 }), false)?;
+    let list = list.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Terminal → tab (the tree only knows tabs by `tab_resource_id`).
+    let tabs = conn.call("tab.list", json!({ "session": session }), false)?;
+    let tab_of: std::collections::HashMap<String, String> = tabs
+        .as_array()
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|t| Some((t.get("content_id")?.as_str()?.to_string(), t.get("id")?.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = |n: &Value, key: &str| n.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut seen = Vec::new();
+    let mut notes: Vec<Note> = list
+        .iter()
+        .filter_map(|n| {
+            let read_here = n
+                .get("read_by")
+                .and_then(Value::as_array)
+                .is_some_and(|by| by.iter().any(|c| c.as_str() == Some(CLIENT_ID)));
+            let id = n.get("id")?.as_str()?.to_string();
+            let shared_unread = n.get("unread").and_then(Value::as_bool).unwrap_or(false);
+            if !shared_unread && !read_here {
+                seen.push(id.clone());
+            }
+            Some(Note {
+                id,
+                tab_id: n.get("terminal_id").and_then(Value::as_str).and_then(|t| tab_of.get(t).cloned()),
+                title: text(n, "title"),
+                body: text(n, "body"),
+                level: text(n, "level"),
+                created_at: n.get("created_at_ms").and_then(|v| v.as_str()?.parse().ok().or(v.as_u64())).unwrap_or(0),
+                unread: shared_unread && !read_here,
+            })
+        })
+        .collect();
+    notes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok((notes, seen))
+}
+
+/// A minimal `cmux.protocol/2` client: one JSON envelope per line on the
+/// session socket. Every operation is addressed to this machine and a
+/// session (by name).
+struct V2 {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    machine: String,
+    next: u64,
+}
+
+impl V2 {
+    fn connect(path: &Path) -> Result<Self, String> {
+        let writer = UnixStream::connect(path).map_err(|e| e.to_string())?;
+        writer.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(writer.try_clone().map_err(|e| e.to_string())?);
+        let mut conn = Self { reader, writer, machine: String::new(), next: 0 };
+        let machines = conn.request("machine.list", json!({}), false)?;
+        conn.machine = machines
+            .pointer("/0/id")
+            .and_then(Value::as_str)
+            .ok_or("no machine in machine.list")?
+            .to_string();
+        Ok(conn)
+    }
+
+    fn call(&mut self, operation: &str, mut params: Value, mutation: bool) -> Result<Value, String> {
+        params["machine"] = json!(self.machine);
+        self.request(operation, params, mutation)
+    }
+
+    fn request(&mut self, operation: &str, params: Value, mutation: bool) -> Result<Value, String> {
+        self.next += 1;
+        let id = format!("gtk-{}", self.next);
+        let mut envelope = json!({
+            "protocol": "cmux.protocol/2",
+            "type": "request",
+            "id": id,
+            "operation": operation,
+            "params": params,
+        });
+        if mutation {
+            // Unique per request: each click is a new mutation, never a replay.
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            envelope["idempotency_key"] = json!(format!("cmux-gtk-{}-{nanos}-{}", std::process::id(), self.next));
+        }
+        let mut line = envelope.to_string();
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        loop {
+            let mut reply = String::new();
+            if self.reader.read_line(&mut reply).map_err(|e| e.to_string())? == 0 {
+                return Err("connection closed".into());
+            }
+            let Ok(reply) = serde_json::from_str::<Value>(&reply) else { continue };
+            if reply.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                continue;
+            }
+            if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+                return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
+            }
+            let message = reply.pointer("/error/message").and_then(Value::as_str).unwrap_or("request failed");
+            return Err(format!("{operation}: {message}"));
         }
     }
 }

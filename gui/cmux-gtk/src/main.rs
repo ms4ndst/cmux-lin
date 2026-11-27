@@ -1,4 +1,4 @@
-//! cmux-gtk: a prototype native GTK4 frontend for a cmux-tui session.
+//! cmux-gtk: a native GTK4 frontend for a cmux-tui session.
 //!
 //! The cmux-tui server stays the source of truth. This window lists the
 //! session's workspaces and renders the selected workspace's active screen:
@@ -14,7 +14,9 @@
 //!
 //! Agent attention (blocked / finished / unread notification / working) is
 //! shown as badges on tabs and sidebar rows; notifications also go to the
-//! desktop, and clicking one jumps to its tab.
+//! desktop, and clicking one jumps to its tab. The header bar's bell opens
+//! the notification panel: every retained notification, unread count, jump
+//! to the latest unread (Ctrl+Shift+J), mark all read, clear all.
 //!
 //! Layout actions (new tab, split, close, select tab, divider drags) are
 //! sent to the server; the window only redraws from the tree the server
@@ -29,6 +31,7 @@ mod attention;
 mod backend;
 mod browser;
 mod files;
+mod notes;
 mod theme;
 
 use cmux_browser_provider as provider;
@@ -77,6 +80,7 @@ const CSS: &str = "
 .pane.focused .pane-tabs { background: alpha(@accent_color, 0.12); }
 .browser-bar { padding: 2px 4px; }
 .browser-bar entry { min-height: 0; }
+.notes-count { font-weight: bold; font-size: smaller; }
 ";
 
 /// One pane on screen: its tab strip, its terminal, and the attachment for
@@ -197,6 +201,8 @@ struct State {
     provider: Option<provider::ProviderHandle>,
     /// Why the built-in provider can't start a browser, if it can't.
     browser_problem: Option<String>,
+    /// The session's retained notifications, newest first.
+    notes: Vec<backend::Note>,
 }
 
 impl State {
@@ -227,6 +233,8 @@ struct Ui {
     /// Workspaces / Files.
     sidebar_stack: gtk::Stack,
     files: files::FilesView,
+    /// The notification panel behind the header bar's bell.
+    notes: notes::NotesPanel,
     /// The selected workspace's screens, above the panes.
     screens: gtk::Box,
     content: gtk::Box,
@@ -293,6 +301,18 @@ fn build_ui(app: &gtk::Application, session: &str) {
     main_menu.set_tooltip_text(Some("Menu"));
     main_menu.set_menu_model(Some(&build_main_menu()));
     header.pack_end(&main_menu);
+    // Notification panel; its requests are wired up once the state exists.
+    let notes_host_slot: Rc<RefCell<Option<notes::Host>>> = Rc::new(RefCell::new(None));
+    let notes_panel = notes::NotesPanel::new(Rc::new({
+        let slot = notes_host_slot.clone();
+        move |request| {
+            let host = slot.borrow().clone();
+            if let Some(host) = host {
+                host(request);
+            }
+        }
+    }));
+    header.pack_end(&notes_panel.button);
     window.set_titlebar(Some(&header));
 
     let list = gtk::ListBox::new();
@@ -403,6 +423,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         agents_list: agents_list.clone(),
         sidebar_stack: sidebar_stack.clone(),
         files: files_view.clone(),
+        notes: notes_panel.clone(),
         screens,
         content,
         status: status.clone(),
@@ -414,7 +435,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
     let (ui_tx, ui_rx) = async_channel::unbounded::<UiMsg>();
     let (ctl_tx, ctl_rx) = mpsc::channel::<Ctl>();
     let socket_path = config.socket_path.clone();
-    backend::spawn_control(config, ctl_rx, ui_tx.clone());
+    backend::spawn_control(config, session.to_string(), ctl_rx, ui_tx.clone());
     backend::spawn_events(socket_path.clone(), ctl_tx.clone(), ui_tx.clone());
     // Start the session if it isn't running (after a reboot nothing else
     // does), like plain `cmux`. Only at launch: a session that stops while
@@ -450,6 +471,7 @@ fn build_ui(app: &gtk::Application, session: &str) {
         noted_at: None,
         provider: None,
         browser_problem: None,
+        notes: Vec::new(),
     }));
     state.borrow_mut().ui = Some(ui.clone());
     let watches = watch_theme(&state);
@@ -480,6 +502,21 @@ fn build_ui(app: &gtk::Application, session: &str) {
                     st.send(Ctl::request(json!({ "cmd": "new-browser-tab", "pane": pane, "url": files::file_url(&file) })));
                 }
             }
+        }
+    }));
+
+    *notes_host_slot.borrow_mut() = Some(Rc::new({
+        let state = state.clone();
+        let ui = ui.clone();
+        move |request| match request {
+            notes::Request::Show(tab) => {
+                let surface = surface_of_tab(&state, &tab);
+                if let Some(surface) = surface {
+                    show_surface_tab(&state, &ui, surface);
+                }
+            }
+            notes::Request::ReadAll => mark_all_read(&state),
+            notes::Request::ClearAll => state.borrow().send(Ctl::NotesClear),
         }
     }));
 
@@ -648,6 +685,11 @@ fn build_ui(app: &gtk::Application, session: &str) {
                     UiMsg::Tree(workspaces, agents) => {
                         state.borrow_mut().agents = agents;
                         on_tree(&state, &ui, workspaces);
+                        draw_notes(&state, &ui);
+                    }
+                    UiMsg::Notes(notes) => {
+                        state.borrow_mut().notes = notes;
+                        draw_notes(&state, &ui);
                     }
                     UiMsg::Notification { id, title, body, level, surface } => {
                         on_notification(&state, &ui, id, &title, &body, &level, surface);
@@ -772,9 +814,20 @@ fn build_ui(app: &gtk::Application, session: &str) {
 
     if let Some(path) = std::env::var_os("CMUX_GTK_SNAPSHOT") {
         let window = window.clone();
+        let panel = ui.notes.popover();
         glib::timeout_add_local(Duration::from_secs(2), move || {
-            if let Err(error) = snapshot_png(&window, &path) {
+            if let Err(error) = snapshot_png(window.upcast_ref(), &path) {
                 eprintln!("cmux-gtk: snapshot failed: {error}");
+            }
+            // The notification panel is its own surface: saved beside it
+            // (`<name>-notes.png`) while open.
+            if panel.is_visible() {
+                let mut notes_path = std::path::PathBuf::from(&path);
+                notes_path.set_extension("");
+                let notes_path = format!("{}-notes.png", notes_path.display());
+                if let Err(error) = snapshot_png(panel.upcast_ref(), std::ffi::OsStr::new(&notes_path)) {
+                    eprintln!("cmux-gtk: panel snapshot failed: {error}");
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -909,6 +962,12 @@ fn build_main_menu() -> gio::Menu {
     look.append_submenu(Some("Theme"), &themes);
     look.append(Some("Workspaces / Files (Ctrl+Shift+F)"), Some("app.toggle-files"));
     menu.append_section(None, &look);
+    let notifications = gio::Menu::new();
+    notifications.append(Some("Notifications (Ctrl+Shift+I)"), Some("app.notifications"));
+    notifications.append(Some("Jump to latest unread (Ctrl+Shift+J)"), Some("app.jump-unread"));
+    notifications.append(Some("Mark all notifications read"), Some("app.notifications-read"));
+    notifications.append(Some("Clear all notifications"), Some("app.notifications-clear"));
+    menu.append_section(None, &notifications);
     let workspace = gio::Menu::new();
     workspace.append(Some("Start session"), Some("app.start-session"));
     workspace.append(Some("New workspace"), Some("app.new-workspace"));
@@ -964,6 +1023,32 @@ fn install_app_actions(app: &gtk::Application, state: &Shared, ui: &Ui, session:
         }
     });
     app.add_action(&theme);
+
+    // Notification panel actions (menu, shortcuts, D-Bus).
+    let notifications = gio::SimpleAction::new("notifications", None);
+    notifications.connect_activate({
+        let ui = ui.clone();
+        move |_, _| ui.notes.toggle()
+    });
+    app.add_action(&notifications);
+    let jump = gio::SimpleAction::new("jump-unread", None);
+    jump.connect_activate({
+        let (state, ui) = (state.clone(), ui.clone());
+        move |_, _| jump_to_latest_unread(&state, &ui)
+    });
+    app.add_action(&jump);
+    let read = gio::SimpleAction::new("notifications-read", None);
+    read.connect_activate({
+        let state = state.clone();
+        move |_, _| mark_all_read(&state)
+    });
+    app.add_action(&read);
+    let clear = gio::SimpleAction::new("notifications-clear", None);
+    clear.connect_activate({
+        let state = state.clone();
+        move |_, _| state.borrow().send(Ctl::NotesClear)
+    });
+    app.add_action(&clear);
 
     let new_workspace = gio::SimpleAction::new("new-workspace", None);
     new_workspace.connect_activate({
@@ -1132,6 +1217,13 @@ fn install_shortcuts(window: &gtk::ApplicationWindow, state: &Shared) {
             close_with_shells(st, Closing::Tab(surface));
         }
     });
+    // These work with no pane too.
+    for (accel, action) in [("<Control><Shift>i", "app.notifications"), ("<Control><Shift>j", "app.jump-unread")] {
+        controller.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(accel),
+            Some(gtk::NamedAction::new(action)),
+        ));
+    }
     bind("<Control>Page_Down", |st, pane| step_tab(st, pane, 1));
     bind("<Control>Page_Up", |st, pane| step_tab(st, pane, -1));
     window.add_controller(controller);
@@ -2570,6 +2662,76 @@ fn show_surface_tab(state: &Shared, ui: &Ui, surface: u64) {
     }
 }
 
+/// The surface of the tab with this `tab_…` id, on any screen.
+fn surface_of_tab(state: &Shared, tab_id: &str) -> Option<u64> {
+    let st = state.borrow();
+    st.raw
+        .iter()
+        .find_map(|ws| ws.all_tabs().find(|t| t.tab_id.as_deref() == Some(tab_id)).map(|t| t.surface))
+}
+
+/// Redraw the notification panel: each note with where its tab is.
+fn draw_notes(state: &Shared, ui: &Ui) {
+    let st = state.borrow();
+    let rows: Vec<notes::Row> = st
+        .notes
+        .iter()
+        .map(|note| {
+            let place = note.tab_id.as_deref().and_then(|tab_id| {
+                st.raw.iter().find_map(|ws| {
+                    let tab = ws.all_tabs().find(|t| t.tab_id.as_deref() == Some(tab_id))?;
+                    let ws_name = if ws.name.is_empty() { format!("Workspace {}", ws.id) } else { ws.name.clone() };
+                    let tab_name = tab.name.clone().unwrap_or_else(|| tab.title.clone());
+                    Some(if tab_name.is_empty() { ws_name } else { format!("{ws_name} · {tab_name}") })
+                })
+            });
+            notes::Row { note, place }
+        })
+        .collect();
+    ui.notes.show(&rows);
+}
+
+/// Jump to the tab of the newest unread notification (the macOS app's
+/// "jump to latest unread").
+fn jump_to_latest_unread(state: &Shared, ui: &Ui) {
+    let target = {
+        let st = state.borrow();
+        st.notes.iter().filter(|n| n.unread).find_map(|n| {
+            let tab_id = n.tab_id.as_deref()?;
+            st.raw.iter().find_map(|ws| ws.all_tabs().find(|t| t.tab_id.as_deref() == Some(tab_id)).map(|t| t.surface))
+        })
+    };
+    match target {
+        Some(surface) => show_surface_tab(state, ui, surface),
+        None => ui.status.set_text("No unread notifications"),
+    }
+}
+
+/// Mark every unread notification read: by tab where its tab exists (that
+/// clears the tab's marker for every client, as looking at it would), and
+/// for this window in the session's ledger, which also covers notes whose
+/// tab has closed.
+fn mark_all_read(state: &Shared) {
+    let st = state.borrow();
+    let unread: Vec<&backend::Note> = st.notes.iter().filter(|n| n.unread).collect();
+    if unread.is_empty() {
+        return;
+    }
+    let mut surfaces: Vec<u64> = unread
+        .iter()
+        .filter_map(|n| {
+            let tab_id = n.tab_id.as_deref()?;
+            st.raw.iter().find_map(|ws| ws.all_tabs().find(|t| t.tab_id.as_deref() == Some(tab_id)).map(|t| t.surface))
+        })
+        .collect();
+    surfaces.sort_unstable();
+    surfaces.dedup();
+    for surface in surfaces {
+        st.send(Ctl::request(json!({ "cmd": "ack-tab-notifications", "surface": surface })));
+    }
+    st.send(Ctl::NotesRead(unread.iter().map(|n| n.id.clone()).collect()));
+}
+
 /// Undoing would close panes: say how many and confirm (with the preview's
 /// revision, so a layout that changed meanwhile is refused, not undone).
 fn confirm_undo(state: &Shared, pane: u64, revision: u64, closes: usize) {
@@ -2852,7 +3014,7 @@ fn reapply_terminal_colors(state: &Shared) {
     }
 }
 
-fn snapshot_png(window: &gtk::ApplicationWindow, path: &std::ffi::OsStr) -> Result<(), String> {
+fn snapshot_png(window: &gtk::Widget, path: &std::ffi::OsStr) -> Result<(), String> {
     let (w, h) = (window.width(), window.height());
     let paintable = gtk::WidgetPaintable::new(Some(window));
     let snapshot = gtk::Snapshot::new();

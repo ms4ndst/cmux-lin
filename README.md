@@ -89,7 +89,7 @@ Upstream's docs for everything the multiplexer can do are in `build/cmux/cmux-tu
 
 ### The GTK window
 
-cmux-gtk is a native window for a session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses). It's another client of the same server, so the TUI, the window and agents all see the same workspaces. Each window keeps its own selection, as upstream intends. It has workspaces, screens, splits and tabs; browser tabs; drag-and-drop between panes and workspaces; agent badges, an agents queue and desktop notifications; a files view; and a ☰ menu with themes and workspace actions. See [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md) for everything it does.
+cmux-gtk is a native window for a session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses). It's another client of the same server, so the TUI, the window and agents all see the same workspaces. Each window keeps its own selection, as upstream intends. It has workspaces, screens, splits and tabs; browser tabs; drag-and-drop between panes and workspaces; agent badges, an agents queue, a notification panel and desktop notifications; a files view; and a ☰ menu with themes and workspace actions. See [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md) for everything it does.
 
 ### Browser tabs
 
