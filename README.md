@@ -48,10 +48,13 @@ cmux-lin/
 │   ├── 10-install-toolchain.sh   # rustup (stable) + Zig 0.16.0 + prereq checks
 │   ├── 20-fetch-source.sh        # clone cmux at the pin, init the ghostty submodule
 │   ├── 30-build.sh               # build cmux-tui, the browser provider and (optionally) cmux-gtk
-│   ├── 40-install.sh             # install everything to ~/.local/bin, themes, launcher entry
+│   ├── 40-install.sh             # install everything to ~/.local/bin, themes, launcher entry, completions
+│   ├── 50-package-rpm.sh         # package the built tree as an RPM in dist/
+│   ├── gen-completions.py        # bash/zsh/fish completions from cmux-tui's own help
 │   ├── cmux-theme.sh             # the cmux-theme switcher (installed as cmux-theme)
 │   ├── install-theme-picker.py   # theme picker + quit key in the TUI config
 │   └── convert-scrollwerk-themes.py  # generates the sw-* themes
+├── packaging/                    # cmux-lin.spec for the RPM
 ├── patches/                      # local patch applied on top of the pinned source
 ├── assets/                       # default config (cmux-tui.json) and themes/
 ├── browser-provider/             # cmux-browser-provider (browser tabs on Linux)
@@ -73,6 +76,30 @@ Prerequisites (Fedora): `git`, `curl`, `gcc`, and LLVM/clang with `libclang` (`d
 
 Everything installs into `~/.local/bin` (on the default Fedora `PATH`): `cmux-tui` with a `cmux` symlink, `cmux-tui-hook`, `cmux-browser-provider`, `cmux-theme`, and, when the GTK libraries were present at build time, `cmux-gtk` with a **cmux** entry in your application launcher. Without them the GTK window is skipped and everything else installs as usual.
 
+It also installs shell completions for `cmux`, `cmux-tui`, `cmux-theme` and `cmux-gtk`. They complete commands, actions, session names and theme names.
+
+- bash: `~/.local/share/bash-completion/completions`
+- fish: `~/.config/fish/completions`
+- zsh: `~/.local/share/zsh/site-functions`, which you add to `fpath` yourself.
+
+`scripts/gen-completions.py` generates them from the installed `cmux-tui`'s own `--help`, so they match the pinned revision.
+
+### RPM
+
+After `30-build.sh`, `./scripts/50-package-rpm.sh` packages the built tree as a binary RPM in `dist/`:
+
+```bash
+./scripts/50-package-rpm.sh
+sudo dnf install dist/cmux-lin-*.rpm
+```
+
+It installs into `/usr`:
+- the same programs;
+- the themes and default config in `/usr/share/cmux-lin`;
+- the launcher entry, and system-wide completions for bash, zsh and fish.
+
+`cmux-theme` copies the shipped themes into `~/.config/cmux/themes` the first time it runs, and never overwrites your own. If you also used `40-install.sh`, the copies in `~/.local/bin` come first on `PATH`. There's no Flatpak: a terminal multiplexer has to run your host shells and tools, which a Flatpak sandbox would only allow by escaping it for everything.
+
 ## Run
 
 ```bash
@@ -89,7 +116,7 @@ Upstream's docs for everything the multiplexer can do are in `build/cmux/cmux-tu
 
 ### The GTK window
 
-cmux-gtk is a native window for a session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses). It's another client of the same server, so the TUI, the window and agents all see the same workspaces. Each window keeps its own selection, as upstream intends. It has workspaces (with each one's git branch and listening ports), screens, splits and tabs; browser tabs; drag-and-drop between panes and workspaces; agent badges, an agents queue, a notification panel and desktop notifications; a files view; a command palette with your own `cmux.json` commands and workspace layouts; a settings window; and a ☰ menu with themes and workspace actions. See [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md) for everything it does.
+cmux-gtk is a native window for a session, built on GTK4 and VTE (the terminal widget GNOME Terminal uses). It's another client of the same server, so the TUI, the window and agents all see the same workspaces. Each window keeps its own selection, as upstream intends. It has workspaces (with descriptions, each one's git branch, pull request and listening ports), screens, splits and tabs (whole panes move between workspaces); browser tabs; drag-and-drop between panes and workspaces; agent badges, an agents queue, a notification panel and desktop notifications; a files view; a command palette with your own `cmux.json` commands and workspace layouts; a settings window; an SSH view for opening workspaces on other machines; DevTools and cookie import for browser tabs; and a ☰ menu with themes, sessions and workspace actions. See [gui/cmux-gtk/README.md](gui/cmux-gtk/README.md) for everything it does.
 
 ### Browser tabs
 

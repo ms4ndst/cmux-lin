@@ -33,10 +33,24 @@ RUN_DIR="/run/user/$(id -u)/cmux-tui-$(id -u)"
 
 die() { printf 'cmux-theme: %s\n' "$*" >&2; exit 1; }
 
+# A system install (the RPM) ships a default config: start from it.
+SHARE="${CMUX_LIN_SHARE:-/usr/share/cmux-lin}"
+if [ ! -f "$CONFIG" ] && [ -f "$SHARE/cmux-tui.json" ]; then
+  mkdir -p "$CONFIG_DIR"
+  cp "$SHARE/cmux-tui.json" "$CONFIG"
+fi
 [ -f "$CONFIG" ] || die "no cmux config at $CONFIG (run scripts/40-install.sh first)"
 command -v python3 >/dev/null 2>&1 || die "python3 required"
 command -v cmux >/dev/null 2>&1 || die "cmux not on PATH"
 mkdir -p "$THEME_DIR"
+# A system install (the RPM) ships themes in /usr/share/cmux-lin/themes:
+# copy any you don't have yet, never overwriting your own.
+SHARED_THEMES="$SHARE/themes"
+if [ -d "$SHARED_THEMES" ]; then
+  for f in "$SHARED_THEMES"/*.json; do
+    [ -e "$f" ] && [ ! -e "$THEME_DIR/$(basename "$f")" ] && cp "$f" "$THEME_DIR/"
+  done
+fi
 
 # List installed themes, one per line.
 list_names() {

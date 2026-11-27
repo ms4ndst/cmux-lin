@@ -77,6 +77,26 @@ log "cmux-theme installed with themes: $(ls "$THEME_DEST" | sed 's/\.json//' | t
 # live user config; user-added commands are preserved.
 python3 "$REPO_ROOT/scripts/install-theme-picker.py" "$REPO_ROOT/assets/cmux-tui.json" "$CONFIG_DEST"
 
+# Shell completions for cmux / cmux-tui / cmux-theme / cmux-gtk, generated
+# from the installed cmux-tui's own help so they match the pinned revision.
+COMP_TMP="$(mktemp -d)"
+if python3 "$REPO_ROOT/scripts/gen-completions.py" "$DEST/cmux-tui" "$COMP_TMP" >/dev/null; then
+  BASH_COMP="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+  ZSH_COMP="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+  FISH_COMP="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+  mkdir -p "$BASH_COMP" "$ZSH_COMP" "$FISH_COMP"
+  # bash-completion loads a file by command name: one copy per command.
+  for name in cmux cmux-tui cmux-theme cmux-gtk; do
+    install -m 0644 "$COMP_TMP/bash/cmux" "$BASH_COMP/$name"
+    install -m 0644 "$COMP_TMP/fish/$name.fish" "$FISH_COMP/$name.fish"
+  done
+  install -m 0644 "$COMP_TMP/zsh/_cmux" "$ZSH_COMP/_cmux"
+  log "shell completions installed (bash, fish; zsh: add $ZSH_COMP to fpath)"
+else
+  log "couldn't generate shell completions (skipped)"
+fi
+rm -rf -- "$COMP_TMP"
+
 case ":$PATH:" in
   *":$DEST:"*) ;;
   *) log "NOTE: $DEST is not on PATH; add it to your shell profile." ;;
